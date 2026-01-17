@@ -24,19 +24,19 @@ A Python CLI tool that polls Granola's API for new meeting notes in specified fo
 
 ```bash
 # Using pip
-pip install git+https://github.com/your-org/granola-sync.git
+pip install git+https://github.com/adoval4/granola-sync.git
 
 # Using uv
-uv pip install git+https://github.com/your-org/granola-sync.git
+uv pip install git+https://github.com/adoval4/granola-sync.git
 
 # Using pipx (recommended for CLI tools)
-pipx install git+https://github.com/your-org/granola-sync.git
+pipx install git+https://github.com/adoval4/granola-sync.git
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/your-org/granola-sync.git
+git clone https://github.com/adoval4/granola-sync.git
 cd granola-sync
 pip install -e .
 ```
@@ -216,7 +216,7 @@ cat ~/.granola-sync/state.json | jq '.stats'
 
 ```bash
 # Clone and install in development mode
-git clone https://github.com/your-org/granola-sync.git
+git clone https://github.com/adoval4/granola-sync.git
 cd granola-sync
 pip install -e ".[dev]"
 ```
