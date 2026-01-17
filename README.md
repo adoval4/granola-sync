@@ -28,6 +28,9 @@ pip install git+https://github.com/your-org/granola-sync.git
 
 # Using uv
 uv pip install git+https://github.com/your-org/granola-sync.git
+
+# Using pipx (recommended for CLI tools)
+pipx install git+https://github.com/your-org/granola-sync.git
 ```
 
 ### From source
@@ -229,7 +232,3 @@ pytest
 ```bash
 ruff check src tests
 ```
-
-## License
-
-MIT
