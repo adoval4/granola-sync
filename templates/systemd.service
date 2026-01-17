@@ -1,0 +1,20 @@
+[Unit]
+Description=Granola Sync Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={executable} run
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=granola-sync
+
+# Environment
+Environment="PATH=/usr/local/bin:/usr/bin:/bin:{extra_path}"
+
+[Install]
+WantedBy=default.target
