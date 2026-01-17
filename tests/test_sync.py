@@ -58,10 +58,9 @@ class TestSyncService:
     ):
         """Test sync cycle with no documents."""
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "SQP", "document_ids": []},
-            {"id": "f2", "name": "CLIENT-A", "document_ids": []},
+            {"id": "f1", "title": "SQP", "documents": []},
+            {"id": "f2", "title": "CLIENT-A", "documents": []},
         ]
-        mock_granola.get_documents.return_value = []
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
@@ -79,22 +78,25 @@ class TestSyncService:
     ):
         """Test sync cycle with new documents."""
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "SQP", "document_ids": ["doc1", "doc2"]},
-        ]
-        mock_granola.get_documents.return_value = [
             {
-                "id": "doc1",
-                "title": "Sprint Planning",
-                "created_at": "2026-01-17T10:00:00Z",
-                "people": [{"display_name": "John Doe"}],
-                "last_viewed_panel": {"content": {}},
-            },
-            {
-                "id": "doc2",
-                "title": "Retrospective",
-                "created_at": "2026-01-17T11:00:00Z",
-                "people": [],
-                "last_viewed_panel": {"content": {}},
+                "id": "f1",
+                "title": "SQP",
+                "documents": [
+                    {
+                        "id": "doc1",
+                        "title": "Sprint Planning",
+                        "created_at": "2026-01-17T10:00:00Z",
+                        "people": [{"display_name": "John Doe"}],
+                        "last_viewed_panel": {"content": {}},
+                    },
+                    {
+                        "id": "doc2",
+                        "title": "Retrospective",
+                        "created_at": "2026-01-17T11:00:00Z",
+                        "people": [],
+                        "last_viewed_panel": {"content": {}},
+                    },
+                ],
             },
         ]
         mock_granola.get_transcript.return_value = [
@@ -120,16 +122,19 @@ class TestSyncService:
         state_manager.mark_synced("doc1", {"title": "Test", "updated_at": "2026-01-17T10:00:00Z"}, "SQP")
 
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "SQP", "document_ids": ["doc1"]},
-        ]
-        mock_granola.get_documents.return_value = [
             {
-                "id": "doc1",
-                "title": "Sprint Planning",
-                "created_at": "2026-01-17T10:00:00Z",
-                "updated_at": "2026-01-17T10:00:00Z",  # Same as when marked
-                "people": [],
-                "last_viewed_panel": {"content": {}},
+                "id": "f1",
+                "title": "SQP",
+                "documents": [
+                    {
+                        "id": "doc1",
+                        "title": "Sprint Planning",
+                        "created_at": "2026-01-17T10:00:00Z",
+                        "updated_at": "2026-01-17T10:00:00Z",  # Same as when marked
+                        "people": [],
+                        "last_viewed_panel": {"content": {}},
+                    },
+                ],
             },
         ]
 
@@ -151,16 +156,19 @@ class TestSyncService:
         state_manager.mark_synced("doc1", {"title": "Test", "updated_at": "2026-01-17T10:00:00Z"}, "SQP")
 
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "SQP", "document_ids": ["doc1"]},
-        ]
-        mock_granola.get_documents.return_value = [
             {
-                "id": "doc1",
-                "title": "Sprint Planning",
-                "created_at": "2026-01-17T10:00:00Z",
-                "updated_at": "2026-01-17T12:00:00Z",  # Updated!
-                "people": [],
-                "last_viewed_panel": {"content": {}},
+                "id": "f1",
+                "title": "SQP",
+                "documents": [
+                    {
+                        "id": "doc1",
+                        "title": "Sprint Planning",
+                        "created_at": "2026-01-17T10:00:00Z",
+                        "updated_at": "2026-01-17T12:00:00Z",  # Updated!
+                        "people": [],
+                        "last_viewed_panel": {"content": {}},
+                    },
+                ],
             },
         ]
         mock_granola.get_transcript.return_value = []
@@ -180,18 +188,18 @@ class TestSyncService:
     ):
         """Test sync cycle handles missing folders gracefully."""
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "OTHER", "document_ids": []},
+            {"id": "f1", "title": "OTHER", "documents": []},
         ]
-        mock_granola.get_documents.return_value = []
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
         )
         summary = await service.sync_once()
 
-        # Should not raise, just log warning
+        # Should not raise, just log warning for missing folders
         assert summary["folders_checked"] == 2
         assert summary["by_folder"]["SQP"]["total"] == 0
+        assert summary["by_folder"]["CLIENT-A"]["total"] == 0
 
     @pytest.mark.asyncio
     async def test_sync_once_dry_run(
@@ -199,15 +207,18 @@ class TestSyncService:
     ):
         """Test dry run doesn't send webhooks."""
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "SQP", "document_ids": ["doc1"]},
-        ]
-        mock_granola.get_documents.return_value = [
             {
-                "id": "doc1",
-                "title": "Sprint Planning",
-                "created_at": "2026-01-17T10:00:00Z",
-                "people": [],
-                "last_viewed_panel": {"content": {}},
+                "id": "f1",
+                "title": "SQP",
+                "documents": [
+                    {
+                        "id": "doc1",
+                        "title": "Sprint Planning",
+                        "created_at": "2026-01-17T10:00:00Z",
+                        "people": [],
+                        "last_viewed_panel": {"content": {}},
+                    },
+                ],
             },
         ]
 
@@ -230,15 +241,18 @@ class TestSyncService:
     ):
         """Test handling of webhook failures."""
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "SQP", "document_ids": ["doc1"]},
-        ]
-        mock_granola.get_documents.return_value = [
             {
-                "id": "doc1",
-                "title": "Sprint Planning",
-                "created_at": "2026-01-17T10:00:00Z",
-                "people": [],
-                "last_viewed_panel": {"content": {}},
+                "id": "f1",
+                "title": "SQP",
+                "documents": [
+                    {
+                        "id": "doc1",
+                        "title": "Sprint Planning",
+                        "created_at": "2026-01-17T10:00:00Z",
+                        "people": [],
+                        "last_viewed_panel": {"content": {}},
+                    },
+                ],
             },
         ]
         mock_granola.get_transcript.return_value = []
@@ -263,17 +277,20 @@ class TestSyncService:
         """Test batch size limits documents processed."""
         # Create 10 documents but batch size is 5
         mock_granola.get_folders.return_value = [
-            {"id": "f1", "name": "SQP", "document_ids": [f"doc{i}" for i in range(10)]},
-        ]
-        mock_granola.get_documents.return_value = [
             {
-                "id": f"doc{i}",
-                "title": f"Meeting {i}",
-                "created_at": "2026-01-17T10:00:00Z",
-                "people": [],
-                "last_viewed_panel": {"content": {}},
-            }
-            for i in range(10)
+                "id": "f1",
+                "title": "SQP",
+                "documents": [
+                    {
+                        "id": f"doc{i}",
+                        "title": f"Meeting {i}",
+                        "created_at": "2026-01-17T10:00:00Z",
+                        "people": [],
+                        "last_viewed_panel": {"content": {}},
+                    }
+                    for i in range(10)
+                ],
+            },
         ]
         mock_granola.get_transcript.return_value = []
 

@@ -11,7 +11,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-GRANOLA_API_BASE = "https://api.granola.ai/v0"
+GRANOLA_API_BASE = "https://api.granola.ai"
 TOKEN_REFRESH_BUFFER_SECONDS = 300  # Refresh 5 minutes before expiration
 
 
@@ -181,58 +181,85 @@ class GranolaClient:
             await self._client.aclose()
 
     async def get_folders(self) -> list[dict[str, Any]]:
-        """Get all folders from Granola.
+        """Get all folders (document lists) from Granola.
 
         Returns:
-            List of folder objects with id, name, and document_ids
+            List of folder objects with id, title, and documents
         """
         client = await self._get_client()
         logger.debug("fetching_folders")
 
-        response = await client.get("/folders")
+        response = await client.get("/v2/get-document-lists")
         response.raise_for_status()
 
         data = response.json()
-        folders = data.get("folders", data) if isinstance(data, dict) else data
+        folders = data.get("lists", [])
         logger.debug("folders_fetched", count=len(folders))
         return folders
 
-    async def get_documents(self, limit: int = 100) -> list[dict[str, Any]]:
+    async def get_documents(
+        self, limit: int = 100, offset: int = 0, include_last_viewed_panel: bool = True
+    ) -> list[dict[str, Any]]:
         """Get recent documents from Granola.
 
         Args:
-            limit: Maximum number of documents to fetch
+            limit: Maximum number of documents to fetch per page
+            offset: Number of documents to skip (for pagination)
+            include_last_viewed_panel: Whether to include document content
 
         Returns:
             List of document objects
         """
         client = await self._get_client()
-        logger.debug("fetching_documents", limit=limit)
+        logger.debug("fetching_documents", limit=limit, offset=offset)
 
-        response = await client.get("/documents", params={"limit": limit})
+        response = await client.post(
+            "/v2/get-documents",
+            json={
+                "limit": limit,
+                "offset": offset,
+                "include_last_viewed_panel": include_last_viewed_panel,
+            },
+        )
         response.raise_for_status()
 
         data = response.json()
-        documents = data.get("documents", data) if isinstance(data, dict) else data
+        documents = data.get("docs", data) if isinstance(data, dict) else data
         logger.debug("documents_fetched", count=len(documents))
         return documents
 
-    async def get_document(self, doc_id: str) -> dict[str, Any]:
-        """Get a single document by ID.
+    async def get_all_documents(
+        self, page_size: int = 100, include_last_viewed_panel: bool = True
+    ) -> list[dict[str, Any]]:
+        """Get all documents from Granola with pagination.
 
         Args:
-            doc_id: The document ID
+            page_size: Number of documents to fetch per page
+            include_last_viewed_panel: Whether to include document content
 
         Returns:
-            Document object with full details
+            List of all document objects
         """
-        client = await self._get_client()
-        logger.debug("fetching_document", doc_id=doc_id)
+        documents: list[dict[str, Any]] = []
+        offset = 0
 
-        response = await client.get(f"/documents/{doc_id}")
-        response.raise_for_status()
+        while True:
+            page = await self.get_documents(
+                limit=page_size,
+                offset=offset,
+                include_last_viewed_panel=include_last_viewed_panel,
+            )
+            if not page:
+                break
 
-        return response.json()
+            documents.extend(page)
+
+            if len(page) < page_size:
+                break
+
+            offset += page_size
+
+        return documents
 
     async def get_transcript(self, doc_id: str) -> list[dict[str, Any]]:
         """Get the transcript for a document.
@@ -241,15 +268,19 @@ class GranolaClient:
             doc_id: The document ID
 
         Returns:
-            List of transcript segments with source (microphone/speaker) and text
+            List of transcript entries with speaker, text, and timestamps
         """
         client = await self._get_client()
         logger.debug("fetching_transcript", doc_id=doc_id)
 
-        response = await client.get(f"/documents/{doc_id}/transcript")
+        response = await client.post(
+            "/v1/get-document-transcript",
+            json={"document_id": doc_id},
+        )
         response.raise_for_status()
 
         data = response.json()
-        transcript = data.get("transcript", data) if isinstance(data, dict) else data
+        # The API returns the transcript array directly
+        transcript = data if isinstance(data, list) else data.get("transcript", [])
         logger.debug("transcript_fetched", doc_id=doc_id, segments=len(transcript))
         return transcript

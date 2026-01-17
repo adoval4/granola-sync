@@ -67,10 +67,11 @@ class SyncService:
         Returns:
             Summary of the sync cycle
         """
-        logger.info("sync_cycle_started", folders=self.config.granola.folders, dry_run=dry_run)
+        configured_folders = self.config.granola.folders
+        logger.info("sync_cycle_started", folders=configured_folders, dry_run=dry_run)
 
         summary: dict[str, Any] = {
-            "folders_checked": 0,
+            "folders_checked": len(configured_folders),
             "documents_found": 0,
             "documents_new": 0,
             "documents_synced": 0,
@@ -79,20 +80,35 @@ class SyncService:
         }
 
         try:
-            # 1. Get all folder metadata
+            # 1. Get all folders (includes documents)
             all_folders = await self.granola.get_folders()
 
-            # 2. Get all documents once (more efficient than per-folder)
-            documents = await self.granola.get_documents(limit=100)
-            summary["documents_found"] = len(documents)
+            # 2. Build a lookup by folder title
+            folder_lookup = {f["title"]: f for f in all_folders}
 
             # 3. Process each configured folder
-            for folder_name in self.config.granola.folders:
-                folder_summary = await self._sync_folder(
-                    folder_name, all_folders, documents, dry_run=dry_run
+            for folder_name in configured_folders:
+                folder = folder_lookup.get(folder_name)
+                if not folder:
+                    logger.warning("folder_not_found", name=folder_name)
+                    summary["by_folder"][folder_name] = {
+                        "total": 0,
+                        "new": 0,
+                        "synced": 0,
+                        "failed": 0,
+                        "documents": [],
+                    }
+                    continue
+
+                # Get documents from this folder
+                documents = folder.get("documents", [])
+                summary["documents_found"] += len(documents)
+
+                # Sync documents in this folder
+                folder_summary = await self._sync_documents(
+                    folder_name, documents, dry_run=dry_run
                 )
                 summary["by_folder"][folder_name] = folder_summary
-                summary["folders_checked"] += 1
                 summary["documents_new"] += folder_summary["new"]
                 summary["documents_synced"] += folder_summary["synced"]
                 summary["documents_failed"] += folder_summary["failed"]
@@ -103,7 +119,8 @@ class SyncService:
 
             logger.info(
                 "sync_cycle_completed",
-                folders=summary["folders_checked"],
+                folders_checked=summary["folders_checked"],
+                documents_found=summary["documents_found"],
                 new=summary["documents_new"],
                 synced=summary["documents_synced"],
                 failed=summary["documents_failed"],
@@ -115,47 +132,38 @@ class SyncService:
 
         return summary
 
-    async def _sync_folder(
+    async def _sync_documents(
         self,
-        folder_name: str,
-        all_folders: list[dict[str, Any]],
+        folder_label: str,
         documents: list[dict[str, Any]],
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Sync a single folder.
+        """Sync documents.
 
         Args:
-            folder_name: Name of the folder to sync
-            all_folders: List of all folders from the API
+            folder_label: Label to use in webhook payload
             documents: List of all documents from the API
             dry_run: If True, don't send webhooks
 
         Returns:
-            Summary of documents processed for this folder
+            Summary of documents processed
         """
-        summary = {"total": 0, "new": 0, "synced": 0, "failed": 0, "documents": []}
-
-        folder = self._find_folder(all_folders, folder_name)
-        if not folder:
-            logger.warning("folder_not_found", name=folder_name)
-            return summary
-
-        # Update folder metadata in state
-        self.state.update_folder(folder_name, folder.get("id", ""))
-
-        # Filter documents belonging to this folder
-        folder_doc_ids = set(folder.get("document_ids", []))
-        folder_docs = [d for d in documents if d.get("id") in folder_doc_ids]
-        summary["total"] = len(folder_docs)
+        summary: dict[str, Any] = {
+            "total": len(documents),
+            "new": 0,
+            "synced": 0,
+            "failed": 0,
+            "documents": [],
+        }
 
         # Find new/updated documents
-        new_docs = self._filter_new_documents(folder_docs)
+        new_docs = self._filter_new_documents(documents)
         summary["new"] = len(new_docs)
 
         logger.info(
             "sync_check",
-            folder=folder_name,
-            total=len(folder_docs),
+            folder_label=folder_label,
+            total=len(documents),
             new=len(new_docs),
             dry_run=dry_run,
         )
@@ -170,7 +178,7 @@ class SyncService:
                 })
                 summary["synced"] += 1
             else:
-                success = await self._process_document(doc, folder_name)
+                success = await self._process_document(doc, folder_label)
                 summary["documents"].append({
                     "id": doc["id"],
                     "title": doc.get("title", "Untitled"),
@@ -182,23 +190,6 @@ class SyncService:
                     summary["failed"] += 1
 
         return summary
-
-    def _find_folder(
-        self, all_folders: list[dict[str, Any]], folder_name: str
-    ) -> Optional[dict[str, Any]]:
-        """Find a folder by name.
-
-        Args:
-            all_folders: List of all folders
-            folder_name: Name to search for
-
-        Returns:
-            Folder dict if found, None otherwise
-        """
-        for folder in all_folders:
-            if folder.get("name") == folder_name:
-                return folder
-        return None
 
     def _filter_new_documents(
         self, documents: list[dict[str, Any]]
@@ -295,17 +286,39 @@ class SyncService:
         Returns:
             Webhook payload dict
         """
-        # Extract participants from people array and calendar attendees
+        # Extract participants from people.attendees (new API structure)
+        # or from attendees array (fallback)
         participants = []
-        for person in doc.get("people", []):
-            name = person.get("display_name") or person.get("name")
-            if name:
-                participants.append(name)
+        people = doc.get("people", {})
+        if isinstance(people, dict):
+            # New API structure: people.attendees is an array of {name, email}
+            for attendee in people.get("attendees", []):
+                name = attendee.get("name") or attendee.get("email")
+                if name:
+                    participants.append(name)
+        elif isinstance(people, list):
+            # Legacy structure: people is an array
+            for person in people:
+                name = person.get("display_name") or person.get("name")
+                if name:
+                    participants.append(name)
+
+        # Also check top-level attendees array
+        for attendee in doc.get("attendees", []):
+            if isinstance(attendee, str) and attendee not in participants:
+                participants.append(attendee)
 
         # Convert ProseMirror content to text (simplified)
-        note_text = self._prosemirror_to_text(
-            doc.get("last_viewed_panel", {}).get("content", {})
-        )
+        # Content can be a ProseMirror doc, a string, or null
+        last_viewed_panel = doc.get("last_viewed_panel") or {}
+        content = last_viewed_panel.get("content") if isinstance(last_viewed_panel, dict) else None
+
+        if isinstance(content, str):
+            note_text = content
+        elif isinstance(content, dict):
+            note_text = self._prosemirror_to_text(content)
+        else:
+            note_text = ""
 
         # Format transcript
         transcript_text = ""

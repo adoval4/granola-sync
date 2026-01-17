@@ -177,35 +177,35 @@ class TestGranolaClient:
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_folders(self, client):
-        """Test fetching folders."""
+        """Test fetching folders via GET /v2/get-document-lists."""
         mock_folders = [
-            {"id": "folder1", "name": "SQP", "document_ids": ["doc1", "doc2"]},
-            {"id": "folder2", "name": "CLIENT-A", "document_ids": ["doc3"]},
+            {"id": "folder1", "title": "Sales Calls", "documents": []},
+            {"id": "folder2", "title": "Standups", "documents": [{"id": "doc1"}]},
         ]
 
-        respx.get("https://api.granola.ai/v0/folders").mock(
-            return_value=httpx.Response(200, json={"folders": mock_folders})
+        respx.get("https://api.granola.ai/v2/get-document-lists").mock(
+            return_value=httpx.Response(200, json={"lists": mock_folders})
         )
 
         folders = await client.get_folders()
 
         assert len(folders) == 2
-        assert folders[0]["name"] == "SQP"
-        assert folders[1]["name"] == "CLIENT-A"
+        assert folders[0]["title"] == "Sales Calls"
+        assert folders[1]["title"] == "Standups"
 
         await client.close()
 
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_documents(self, client):
-        """Test fetching documents."""
+        """Test fetching documents via POST /v2/get-documents."""
         mock_documents = [
             {"id": "doc1", "title": "Meeting 1", "created_at": "2026-01-17T10:00:00Z"},
             {"id": "doc2", "title": "Meeting 2", "created_at": "2026-01-17T11:00:00Z"},
         ]
 
-        respx.get("https://api.granola.ai/v0/documents").mock(
-            return_value=httpx.Response(200, json={"documents": mock_documents})
+        respx.post("https://api.granola.ai/v2/get-documents").mock(
+            return_value=httpx.Response(200, json={"docs": mock_documents})
         )
 
         documents = await client.get_documents(limit=100)
@@ -217,38 +217,43 @@ class TestGranolaClient:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_get_document(self, client):
-        """Test fetching a single document."""
-        mock_document = {
-            "id": "doc1",
-            "title": "Sprint Planning",
-            "created_at": "2026-01-17T10:00:00Z",
-            "people": [{"display_name": "John Doe"}],
-            "last_viewed_panel": {"content": {}},
-        }
+    async def test_get_all_documents(self, client):
+        """Test fetching all documents with pagination."""
+        page1 = [
+            {"id": "doc1", "title": "Meeting 1"},
+            {"id": "doc2", "title": "Meeting 2"},
+        ]
+        page2 = [
+            {"id": "doc3", "title": "Meeting 3"},
+        ]
 
-        respx.get("https://api.granola.ai/v0/documents/doc1").mock(
-            return_value=httpx.Response(200, json=mock_document)
-        )
+        # Mock two pages of results
+        route = respx.post("https://api.granola.ai/v2/get-documents")
+        route.side_effect = [
+            httpx.Response(200, json={"docs": page1}),
+            httpx.Response(200, json={"docs": page2}),
+            httpx.Response(200, json={"docs": []}),
+        ]
 
-        document = await client.get_document("doc1")
+        documents = await client.get_all_documents(page_size=2)
 
-        assert document["id"] == "doc1"
-        assert document["title"] == "Sprint Planning"
+        assert len(documents) == 3
+        assert documents[0]["title"] == "Meeting 1"
+        assert documents[2]["title"] == "Meeting 3"
 
         await client.close()
 
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_transcript(self, client):
-        """Test fetching a document transcript."""
+        """Test fetching a document transcript via POST /v1/get-document-transcript."""
         mock_transcript = [
             {"source": "microphone", "text": "Hello everyone"},
             {"source": "speaker", "text": "Hi there"},
         ]
 
-        respx.get("https://api.granola.ai/v0/documents/doc1/transcript").mock(
-            return_value=httpx.Response(200, json={"transcript": mock_transcript})
+        respx.post("https://api.granola.ai/v1/get-document-transcript").mock(
+            return_value=httpx.Response(200, json=mock_transcript)
         )
 
         transcript = await client.get_transcript("doc1")
@@ -262,12 +267,12 @@ class TestGranolaClient:
     @pytest.mark.asyncio
     async def test_api_error_handling(self, client):
         """Test handling of API errors."""
-        respx.get("https://api.granola.ai/v0/folders").mock(
+        respx.post("https://api.granola.ai/v2/get-documents").mock(
             return_value=httpx.Response(401, json={"error": "Unauthorized"})
         )
 
         with pytest.raises(httpx.HTTPStatusError):
-            await client.get_folders()
+            await client.get_documents()
 
         await client.close()
 
@@ -275,13 +280,13 @@ class TestGranolaClient:
     @pytest.mark.asyncio
     async def test_client_reuses_connection(self, client):
         """Test that the client reuses the HTTP connection."""
-        respx.get("https://api.granola.ai/v0/folders").mock(
-            return_value=httpx.Response(200, json={"folders": []})
+        respx.post("https://api.granola.ai/v2/get-documents").mock(
+            return_value=httpx.Response(200, json={"docs": []})
         )
 
         # Make two requests
-        await client.get_folders()
-        await client.get_folders()
+        await client.get_documents()
+        await client.get_documents()
 
         # Should have reused the same client
         assert client._client is not None
