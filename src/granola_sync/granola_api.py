@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,12 +12,92 @@ import structlog
 logger = structlog.get_logger()
 
 GRANOLA_API_BASE = "https://api.granola.ai/v0"
+TOKEN_REFRESH_BUFFER_SECONDS = 300  # Refresh 5 minutes before expiration
+
+
+def get_token_file_path() -> Path:
+    """Get the path to the Granola credentials file.
+
+    Returns:
+        Path to the supabase.json file
+    """
+    if os.name == "nt":
+        # Windows
+        app_data = os.environ.get("APPDATA", "")
+        return Path(app_data) / "Granola" / "supabase.json"
+    elif os.uname().sysname == "Darwin":
+        # macOS
+        return Path.home() / "Library" / "Application Support" / "Granola" / "supabase.json"
+    else:
+        # Linux
+        return Path.home() / ".config" / "Granola" / "supabase.json"
+
+
+def is_token_expired(workos_tokens: dict[str, Any]) -> bool:
+    """Check if the access token has expired or will expire soon.
+
+    Args:
+        workos_tokens: The parsed workos_tokens object
+
+    Returns:
+        True if the token has expired or will expire within the buffer time
+    """
+    current_time = time.time() * 1000  # Convert to milliseconds
+    token_obtained_at = workos_tokens.get("obtained_at", 0)
+    expires_in_ms = workos_tokens.get("expires_in", 0) * 1000
+    expiration_time = token_obtained_at + expires_in_ms
+    buffer_time = TOKEN_REFRESH_BUFFER_SECONDS * 1000
+
+    return current_time >= (expiration_time - buffer_time)
+
+
+def refresh_access_token(workos_tokens: dict[str, Any]) -> dict[str, Any]:
+    """Refresh the access token using the refresh token.
+
+    Args:
+        workos_tokens: The current workos_tokens object
+
+    Returns:
+        Updated workos_tokens with new access token
+
+    Raises:
+        httpx.HTTPStatusError: If the refresh request fails
+    """
+    logger.debug("refreshing_access_token")
+
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(
+            "https://api.granola.ai/v1/refresh-access-token",
+            headers={
+                "Authorization": f"Bearer {workos_tokens['access_token']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "refresh_token": workos_tokens["refresh_token"],
+                "provider": "workos",
+            },
+        )
+        response.raise_for_status()
+        refresh_response = response.json()
+
+    updated_tokens = {
+        **workos_tokens,
+        "access_token": refresh_response["access_token"],
+        "expires_in": refresh_response["expires_in"],
+        "token_type": refresh_response["token_type"],
+        "obtained_at": int(time.time() * 1000),
+        "refresh_token": refresh_response.get("refresh_token", workos_tokens["refresh_token"]),
+    }
+
+    logger.debug("access_token_refreshed")
+    return updated_tokens
 
 
 def get_granola_token() -> str:
     """Get the Granola authentication token from the local storage.
 
-    The token is stored by the Granola desktop app in a JSON file.
+    The token is stored by the Granola desktop app in supabase.json.
+    If the token has expired, it will be refreshed automatically.
 
     Returns:
         The authentication token
@@ -25,31 +106,37 @@ def get_granola_token() -> str:
         FileNotFoundError: If the token file doesn't exist
         ValueError: If the token cannot be found in the file
     """
-    # Granola stores auth data in ~/Library/Application Support/Granola/auth.json on macOS
-    # or ~/.config/Granola/auth.json on Linux
-    if os.name == "nt":
-        # Windows
-        app_data = os.environ.get("APPDATA", "")
-        token_path = Path(app_data) / "Granola" / "auth.json"
-    elif os.uname().sysname == "Darwin":
-        # macOS
-        token_path = Path.home() / "Library" / "Application Support" / "Granola" / "auth.json"
-    else:
-        # Linux
-        token_path = Path.home() / ".config" / "Granola" / "auth.json"
+    token_path = get_token_file_path()
 
     if not token_path.exists():
         raise FileNotFoundError(
-            f"Granola token not found at {token_path}. "
+            f"Granola credentials not found at {token_path}. "
             "Make sure the Granola app is installed and you are logged in."
         )
 
     with open(token_path) as f:
-        auth_data = json.load(f)
+        token_data = json.load(f)
 
-    token = auth_data.get("access_token") or auth_data.get("token")
+    workos_tokens_str = token_data.get("workos_tokens")
+    if not workos_tokens_str:
+        raise ValueError("Could not find workos_tokens in Granola credentials file")
+
+    workos_tokens = json.loads(workos_tokens_str)
+
+    token = workos_tokens.get("access_token")
     if not token:
-        raise ValueError("Could not find access_token in Granola auth file")
+        raise ValueError("Could not find access_token in Granola credentials")
+
+    if is_token_expired(workos_tokens):
+        logger.debug("token_expired_refreshing")
+        try:
+            workos_tokens = refresh_access_token(workos_tokens)
+            token = workos_tokens["access_token"]
+        except Exception as e:
+            raise ValueError(
+                f"Access token has expired and refresh failed: {e}. "
+                "Please re-authenticate in the Granola app."
+            ) from e
 
     return token
 
