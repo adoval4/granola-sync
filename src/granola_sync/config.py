@@ -24,7 +24,7 @@ class GranolaConfig(BaseModel):
 class SyncConfig(BaseModel):
     """Sync settings."""
 
-    interval: int = 300
+    interval: int = 120
     batch_size: int = 10
     retry_attempts: int = 3
     retry_delay: int = 30

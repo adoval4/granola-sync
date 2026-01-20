@@ -101,7 +101,7 @@ def run(
             "-i",
             help="Poll interval in seconds.",
         ),
-    ] = 300,
+    ] = 120,
     include_transcript: Annotated[
         bool,
         typer.Option(
