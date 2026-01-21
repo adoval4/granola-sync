@@ -23,11 +23,9 @@ A Python CLI tool that polls Granola's API for new meeting notes in specified fo
 ### From GitHub
 
 ```bash
-# Using pip
-pip install git+https://github.com/adoval4/granola-sync.git
-
-# Using uv
-uv pip install git+https://github.com/adoval4/granola-sync.git
+# Install pipx if not already installed
+brew install pipx # macOS
+sudo apt install pipx # Debian/Ubuntu
 
 # Using pipx (recommended for CLI tools)
 pipx install git+https://github.com/adoval4/granola-sync.git

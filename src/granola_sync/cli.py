@@ -461,15 +461,13 @@ def _get_executable_path() -> str:
 
 def _get_templates_dir() -> Path:
     """Get the path to the templates directory."""
-    # Check if we're installed as a package
-    import granola_sync
-    package_dir = Path(granola_sync.__file__).parent.parent.parent
-    templates_dir = package_dir / "templates"
-    if templates_dir.exists():
-        return templates_dir
+    # Use importlib.resources to properly locate package data
+    # This works both in development and when installed via pip/pipx
+    from importlib.resources import files
 
-    # Development mode - look in current working directory
-    return Path(__file__).parent.parent.parent / "templates"
+    templates_dir = files("granola_sync").joinpath("templates")
+    # Convert to Path for consistent interface
+    return Path(str(templates_dir))
 
 
 @app.command()
