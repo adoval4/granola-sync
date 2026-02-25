@@ -13,6 +13,18 @@ logger = structlog.get_logger()
 
 GRANOLA_API_BASE = "https://api.granola.ai"
 TOKEN_REFRESH_BUFFER_SECONDS = 300  # Refresh 5 minutes before expiration
+CACHE_FILENAMES = ["cache-v4.json", "cache-v3.json"]
+
+
+def _get_granola_app_dir() -> Path:
+    """Get the platform-specific Granola application data directory."""
+    if os.name == "nt":
+        app_data = os.environ.get("APPDATA", "")
+        return Path(app_data) / "Granola"
+    elif os.uname().sysname == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "Granola"
+    else:
+        return Path.home() / ".config" / "Granola"
 
 
 def get_token_file_path() -> Path:
@@ -21,16 +33,7 @@ def get_token_file_path() -> Path:
     Returns:
         Path to the supabase.json file
     """
-    if os.name == "nt":
-        # Windows
-        app_data = os.environ.get("APPDATA", "")
-        return Path(app_data) / "Granola" / "supabase.json"
-    elif os.uname().sysname == "Darwin":
-        # macOS
-        return Path.home() / "Library" / "Application Support" / "Granola" / "supabase.json"
-    else:
-        # Linux
-        return Path.home() / ".config" / "Granola" / "supabase.json"
+    return _get_granola_app_dir() / "supabase.json"
 
 
 def is_token_expired(workos_tokens: dict[str, Any]) -> bool:
@@ -144,24 +147,28 @@ def get_granola_token() -> str:
 class GranolaCacheReader:
     """Reads folder and document data from the local Granola app cache."""
 
-    def get_cache_path(self) -> Path:
-        if os.name == "nt":
-            app_data = os.environ.get("APPDATA", "")
-            return Path(app_data) / "Granola" / "cache-v3.json"
-        elif os.uname().sysname == "Darwin":
-            return Path.home() / "Library" / "Application Support" / "Granola" / "cache-v3.json"
-        else:
-            return Path.home() / ".config" / "Granola" / "cache-v3.json"
+    def get_cache_paths(self) -> list[Path]:
+        """Return candidate cache paths, newest format first."""
+        app_dir = _get_granola_app_dir()
+        return [app_dir / name for name in CACHE_FILENAMES]
 
     def read_cache(self) -> dict:
-        cache_path = self.get_cache_path()
-        if not cache_path.exists():
-            raise FileNotFoundError(f"Granola cache not found at {cache_path}")
+        paths = self.get_cache_paths()
 
-        with open(cache_path) as f:
-            outer = json.load(f)
+        outer = None
+        for cache_path in paths:
+            if cache_path.exists():
+                logger.debug("reading_cache", path=str(cache_path))
+                with open(cache_path) as f:
+                    outer = json.load(f)
+                break
 
-        # Structure: {"cache": "<JSON string>"} -> {"state": {...}, "version": N}
+        if outer is None:
+            raise FileNotFoundError(
+                f"Granola cache not found. Looked in: {', '.join(str(p) for p in paths)}"
+            )
+
+        # Structure: {"cache": "<JSON string>" | {dict}} -> {"state": {...}, "version": N}
         cache = outer.get("cache", outer)
         if isinstance(cache, str):
             cache = json.loads(cache)
@@ -249,6 +256,7 @@ class GranolaClient:
             List of folder objects with id, title, and documents
         """
         # Try cache first
+        cache_error = None
         try:
             cache = GranolaCacheReader()
             folders = cache.get_folders()
@@ -256,19 +264,26 @@ class GranolaClient:
                 logger.debug("folders_from_cache", count=len(folders))
                 return folders
         except Exception as e:
+            cache_error = e
             logger.warning("cache_read_failed_falling_back_to_api", error=str(e))
 
         # Fallback to API
-        client = await self._get_client()
-        logger.debug("fetching_folders")
+        try:
+            client = await self._get_client()
+            logger.debug("fetching_folders")
 
-        response = await client.get("/v2/get-document-lists")
-        response.raise_for_status()
+            response = await client.get("/v2/get-document-lists")
+            response.raise_for_status()
 
-        data = response.json()
-        folders = data.get("lists", [])
-        logger.debug("folders_fetched", count=len(folders))
-        return folders
+            data = response.json()
+            folders = data.get("lists", [])
+            logger.debug("folders_fetched", count=len(folders))
+            return folders
+        except Exception as api_error:
+            raise RuntimeError(
+                f"Failed to load folders. "
+                f"Cache error: {cache_error}; API error: {api_error}"
+            ) from api_error
 
     async def get_documents(
         self, limit: int = 100, offset: int = 0, include_last_viewed_panel: bool = True
