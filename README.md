@@ -31,6 +31,13 @@ sudo apt install pipx # Debian/Ubuntu
 pipx install git+https://github.com/adoval4/granola-sync.git
 ```
 
+## Upgrade
+
+```bash
+pipx install --force git+https://github.com/adoval4/granola-sync.git
+granola-sync start 
+```
+
 ### From source
 
 ```bash
