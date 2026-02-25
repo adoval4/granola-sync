@@ -141,6 +141,66 @@ def get_granola_token() -> str:
     return token
 
 
+class GranolaCacheReader:
+    """Reads folder and document data from the local Granola app cache."""
+
+    def get_cache_path(self) -> Path:
+        if os.name == "nt":
+            app_data = os.environ.get("APPDATA", "")
+            return Path(app_data) / "Granola" / "cache-v3.json"
+        elif os.uname().sysname == "Darwin":
+            return Path.home() / "Library" / "Application Support" / "Granola" / "cache-v3.json"
+        else:
+            return Path.home() / ".config" / "Granola" / "cache-v3.json"
+
+    def read_cache(self) -> dict:
+        cache_path = self.get_cache_path()
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Granola cache not found at {cache_path}")
+
+        with open(cache_path) as f:
+            outer = json.load(f)
+
+        # Structure: {"cache": "<JSON string>"} -> {"state": {...}, "version": N}
+        cache = outer.get("cache", outer)
+        if isinstance(cache, str):
+            cache = json.loads(cache)
+
+        state = cache.get("state", cache)
+        if isinstance(state, str):
+            state = json.loads(state)
+        return state
+
+    def get_folders(self) -> list[dict[str, Any]]:
+        state = self.read_cache()
+
+        metadata = state.get("documentListsMetadata", {})
+        doc_lists = state.get("documentLists", {})
+        documents = state.get("documents", {})
+
+        folders: list[dict[str, Any]] = []
+        for list_id, meta in metadata.items():
+            doc_ids = doc_lists.get(list_id, [])
+            folder_docs = [documents[did] for did in doc_ids if did in documents]
+            folders.append({
+                "id": meta.get("id", list_id),
+                "title": meta.get("title", ""),
+                "documents": folder_docs,
+            })
+
+        return folders
+
+    def get_document(self, doc_id: str) -> dict[str, Any] | None:
+        state = self.read_cache()
+        return state.get("documents", {}).get(doc_id)
+
+    def get_documents_for_folder(self, folder_title: str) -> list[dict[str, Any]]:
+        for folder in self.get_folders():
+            if folder["title"] == folder_title:
+                return folder["documents"]
+        return []
+
+
 class GranolaClient:
     """Client for interacting with the Granola API."""
 
@@ -183,9 +243,22 @@ class GranolaClient:
     async def get_folders(self) -> list[dict[str, Any]]:
         """Get all folders (document lists) from Granola.
 
+        Tries the local app cache first, falls back to the API.
+
         Returns:
             List of folder objects with id, title, and documents
         """
+        # Try cache first
+        try:
+            cache = GranolaCacheReader()
+            folders = cache.get_folders()
+            if folders:
+                logger.debug("folders_from_cache", count=len(folders))
+                return folders
+        except Exception as e:
+            logger.warning("cache_read_failed_falling_back_to_api", error=str(e))
+
+        # Fallback to API
         client = await self._get_client()
         logger.debug("fetching_folders")
 

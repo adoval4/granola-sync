@@ -308,17 +308,19 @@ class SyncService:
             if isinstance(attendee, str) and attendee not in participants:
                 participants.append(attendee)
 
-        # Convert ProseMirror content to text (simplified)
-        # Content can be a ProseMirror doc, a string, or null
+        # Extract note text: prefer pre-rendered markdown from cache,
+        # then ProseMirror content, then plain text fallback
         last_viewed_panel = doc.get("last_viewed_panel") or {}
         content = last_viewed_panel.get("content") if isinstance(last_viewed_panel, dict) else None
 
-        if isinstance(content, str):
+        if doc.get("notes_markdown"):
+            note_text = doc["notes_markdown"]
+        elif isinstance(content, str):
             note_text = content
         elif isinstance(content, dict):
             note_text = self._prosemirror_to_text(content)
         else:
-            note_text = ""
+            note_text = doc.get("notes_plain", "")
 
         # Format transcript
         transcript_text = ""

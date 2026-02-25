@@ -177,7 +177,7 @@ class TestGranolaClient:
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_folders(self, client):
-        """Test fetching folders via GET /v2/get-document-lists."""
+        """Test fetching folders via API fallback when cache is unavailable."""
         mock_folders = [
             {"id": "folder1", "title": "Sales Calls", "documents": []},
             {"id": "folder2", "title": "Standups", "documents": [{"id": "doc1"}]},
@@ -187,7 +187,11 @@ class TestGranolaClient:
             return_value=httpx.Response(200, json={"lists": mock_folders})
         )
 
-        folders = await client.get_folders()
+        with patch(
+            "granola_sync.granola_api.GranolaCacheReader.get_folders",
+            side_effect=FileNotFoundError("no cache"),
+        ):
+            folders = await client.get_folders()
 
         assert len(folders) == 2
         assert folders[0]["title"] == "Sales Calls"
