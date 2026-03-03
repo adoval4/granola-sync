@@ -24,9 +24,11 @@ class TestStateManager:
     def test_creates_default_state(self, manager: StateManager, state_file: Path):
         """Test that default state is created when file doesn't exist."""
         assert not state_file.exists()
-        assert manager._state["version"] == 1
+        assert manager._state["version"] == 2
         assert manager._state["seen_documents"] == {}
         assert manager._state["failed_documents"] == {}
+        assert manager._state["folder_map"] == {}
+        assert manager._state["pending_documents"] == {}
 
     def test_save_creates_file(self, manager: StateManager, state_file: Path):
         """Test that save creates the state file."""
@@ -35,7 +37,7 @@ class TestStateManager:
         assert state_file.exists()
         with open(state_file) as f:
             data = json.load(f)
-        assert data["version"] == 1
+        assert data["version"] == 2
         assert "last_sync" in data
 
     def test_load_existing_state(self, state_file: Path):
@@ -219,5 +221,63 @@ class TestStateManager:
         manager = StateManager(str(state_file))
 
         # Should fall back to default state
-        assert manager._state["version"] == 1
+        assert manager._state["version"] == 2
         assert manager._state["seen_documents"] == {}
+
+    def test_migrate_v1_to_v2(self, state_file: Path):
+        """Test that v1 state is migrated to v2 with new fields."""
+        v1_state = {
+            "version": 1,
+            "last_sync": "2026-01-17T10:00:00Z",
+            "folders": {},
+            "seen_documents": {"doc1": {"title": "Test"}},
+            "failed_documents": {},
+            "stats": {"total_synced": 1, "total_errors": 0, "last_error": None, "by_folder": {}},
+        }
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(state_file, "w") as f:
+            json.dump(v1_state, f)
+
+        manager = StateManager(str(state_file))
+
+        assert manager._state["version"] == 2
+        assert manager._state["folder_map"] == {}
+        assert manager._state["pending_documents"] == {}
+        # Existing data preserved
+        assert "doc1" in manager._state["seen_documents"]
+
+    def test_folder_map_operations(self, manager: StateManager):
+        """Test folder map get/update operations."""
+        assert manager.get_folder_map() == {}
+
+        manager.update_folder_map({"SQP": "folder-id-1", "CAL": "folder-id-2"})
+        assert manager.get_folder_map() == {"SQP": "folder-id-1", "CAL": "folder-id-2"}
+
+        # Merge additional entries
+        manager.update_folder_map({"NEW": "folder-id-3"})
+        assert len(manager.get_folder_map()) == 3
+
+    def test_pending_document_lifecycle(self, manager: StateManager):
+        """Test pending document mark/get/clear lifecycle."""
+        assert manager.get_pending_documents() == []
+        assert manager.is_document_pending("doc1") is False
+
+        manager.mark_pending("doc1", {"title": "Meeting"}, "SQP")
+        assert manager.is_document_pending("doc1") is True
+
+        pending = manager.get_pending_documents()
+        assert len(pending) == 1
+        assert pending[0]["doc_id"] == "doc1"
+        assert pending[0]["title"] == "Meeting"
+        assert pending[0]["folder_name"] == "SQP"
+        assert pending[0]["check_count"] == 1
+
+        # Re-check increments count
+        manager.mark_pending("doc1", {"title": "Meeting"}, "SQP")
+        pending = manager.get_pending_documents()
+        assert pending[0]["check_count"] == 2
+
+        # Clear removes it
+        manager.clear_pending("doc1")
+        assert manager.is_document_pending("doc1") is False
+        assert manager.get_pending_documents() == []

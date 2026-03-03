@@ -1,7 +1,7 @@
 """Tests for sync service."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -13,10 +13,14 @@ from granola_sync.sync import SyncService
 
 @pytest.fixture
 def config(tmp_path: Path) -> Config:
-    """Create a test configuration."""
+    """Create a test configuration with explicit folder IDs."""
     return Config(
         webhook=WebhookConfig(url="https://example.com/webhook", secret="test-secret"),
-        granola=GranolaConfig(folders=["SQP", "CLIENT-A"], include_transcript=True),
+        granola=GranolaConfig(
+            folders=["SQP", "CLIENT-A"],
+            folder_ids={"SQP": "sqp-folder-id", "CLIENT-A": "client-a-folder-id"},
+            include_transcript=True,
+        ),
         sync=SyncConfig(interval=60, batch_size=5, retry_attempts=2, retry_delay=0),
         state=StateConfig(file=str(tmp_path / "state.json")),
     )
@@ -27,7 +31,8 @@ def mock_granola() -> MagicMock:
     """Create a mock Granola client."""
     mock = MagicMock()
     mock.get_folders = AsyncMock()
-    mock.get_documents = AsyncMock()
+    mock.get_documents = AsyncMock(return_value=[])
+    mock.get_documents_by_folder = AsyncMock(return_value=[])
     mock.get_document = AsyncMock()
     mock.get_transcript = AsyncMock()
     mock.close = AsyncMock()
@@ -49,6 +54,25 @@ def state_manager(tmp_path: Path) -> StateManager:
     return StateManager(str(tmp_path / "state.json"))
 
 
+def _make_doc(doc_id="doc1", title="Sprint Planning", notes_markdown="Some notes", **kwargs):
+    """Helper to create a document dict for testing."""
+    doc = {
+        "id": doc_id,
+        "title": title,
+        "created_at": "2026-01-17T10:00:00Z",
+        "updated_at": kwargs.pop("updated_at", "2026-01-17T10:00:00Z"),
+        "notes_markdown": notes_markdown,
+        "notes_plain": kwargs.pop("notes_plain", notes_markdown),
+        "notes": kwargs.pop("notes", {"type": "doc", "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": notes_markdown}]}
+        ]} if notes_markdown else {"type": "doc", "content": [{"type": "paragraph"}]}),
+        "people": kwargs.pop("people", []),
+        "last_viewed_panel": kwargs.pop("last_viewed_panel", {"content": {}}),
+    }
+    doc.update(kwargs)
+    return doc
+
+
 class TestSyncService:
     """Tests for SyncService class."""
 
@@ -56,11 +80,8 @@ class TestSyncService:
     async def test_sync_once_no_documents(
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
-        """Test sync cycle with no documents."""
-        mock_granola.get_folders.return_value = [
-            {"id": "f1", "title": "SQP", "documents": []},
-            {"id": "f2", "title": "CLIENT-A", "documents": []},
-        ]
+        """Test sync cycle with no documents in folders."""
+        mock_granola.get_documents_by_folder.return_value = []
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
@@ -76,35 +97,29 @@ class TestSyncService:
     async def test_sync_once_new_documents(
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
-        """Test sync cycle with new documents."""
-        mock_granola.get_folders.return_value = [
-            {
-                "id": "f1",
-                "title": "SQP",
-                "documents": [
-                    {
-                        "id": "doc1",
-                        "title": "Sprint Planning",
-                        "created_at": "2026-01-17T10:00:00Z",
-                        "people": [{"display_name": "John Doe"}],
-                        "last_viewed_panel": {"content": {}},
-                    },
-                    {
-                        "id": "doc2",
-                        "title": "Retrospective",
-                        "created_at": "2026-01-17T11:00:00Z",
-                        "people": [],
-                        "last_viewed_panel": {"content": {}},
-                    },
-                ],
-            },
+        """Test sync cycle with new documents that have content."""
+        docs = [
+            _make_doc("doc1", "Sprint Planning", "Notes for sprint"),
+            _make_doc("doc2", "Retrospective", "Retro notes"),
         ]
+        mock_granola.get_documents_by_folder.return_value = docs
         mock_granola.get_transcript.return_value = [
             {"source": "microphone", "text": "Hello"},
         ]
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        # Override to only check SQP folder
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(
+                folders=["SQP"],
+                folder_ids={"SQP": "sqp-folder-id"},
+                include_transcript=True,
+            ),
+            sync=config.sync,
+            state=config.state,
         )
         summary = await service.sync_once()
 
@@ -118,28 +133,19 @@ class TestSyncService:
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
         """Test sync cycle skips already-seen documents."""
-        # Pre-mark document as seen
         state_manager.mark_synced("doc1", {"title": "Test", "updated_at": "2026-01-17T10:00:00Z"}, "SQP")
 
-        mock_granola.get_folders.return_value = [
-            {
-                "id": "f1",
-                "title": "SQP",
-                "documents": [
-                    {
-                        "id": "doc1",
-                        "title": "Sprint Planning",
-                        "created_at": "2026-01-17T10:00:00Z",
-                        "updated_at": "2026-01-17T10:00:00Z",  # Same as when marked
-                        "people": [],
-                        "last_viewed_panel": {"content": {}},
-                    },
-                ],
-            },
-        ]
+        docs = [_make_doc("doc1", "Sprint Planning", "Notes", updated_at="2026-01-17T10:00:00Z")]
+        mock_granola.get_documents_by_folder.return_value = docs
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}),
+            sync=config.sync,
+            state=config.state,
         )
         summary = await service.sync_once()
 
@@ -152,29 +158,20 @@ class TestSyncService:
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
         """Test sync cycle processes updated documents."""
-        # Pre-mark document as seen with old timestamp
         state_manager.mark_synced("doc1", {"title": "Test", "updated_at": "2026-01-17T10:00:00Z"}, "SQP")
 
-        mock_granola.get_folders.return_value = [
-            {
-                "id": "f1",
-                "title": "SQP",
-                "documents": [
-                    {
-                        "id": "doc1",
-                        "title": "Sprint Planning",
-                        "created_at": "2026-01-17T10:00:00Z",
-                        "updated_at": "2026-01-17T12:00:00Z",  # Updated!
-                        "people": [],
-                        "last_viewed_panel": {"content": {}},
-                    },
-                ],
-            },
-        ]
+        docs = [_make_doc("doc1", "Sprint Planning", "Updated notes", updated_at="2026-01-17T12:00:00Z")]
+        mock_granola.get_documents_by_folder.return_value = docs
         mock_granola.get_transcript.return_value = []
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}, include_transcript=True),
+            sync=config.sync,
+            state=config.state,
         )
         summary = await service.sync_once()
 
@@ -183,47 +180,44 @@ class TestSyncService:
         mock_webhook.send.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_sync_once_folder_not_found(
+    async def test_sync_once_folder_not_resolved(
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
-        """Test sync cycle handles missing folders gracefully."""
-        mock_granola.get_folders.return_value = [
-            {"id": "f1", "title": "OTHER", "documents": []},
-        ]
-
+        """Test sync cycle handles unresolvable folder IDs gracefully."""
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
         )
-        summary = await service.sync_once()
+        # No folder_ids configured, no cache available
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["UNKNOWN"], folder_ids={}),
+            sync=config.sync,
+            state=config.state,
+        )
 
-        # Should not raise, just log warning for missing folders
-        assert summary["folders_checked"] == 2
-        assert summary["by_folder"]["SQP"]["total"] == 0
-        assert summary["by_folder"]["CLIENT-A"]["total"] == 0
+        with patch("granola_sync.sync.GranolaCacheReader") as mock_cache_cls:
+            mock_cache_cls.return_value.get_folder_map.side_effect = FileNotFoundError("no cache")
+            summary = await service.sync_once()
+
+        assert summary["folders_checked"] == 1
+        assert summary["by_folder"]["UNKNOWN"]["total"] == 0
 
     @pytest.mark.asyncio
     async def test_sync_once_dry_run(
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
         """Test dry run doesn't send webhooks."""
-        mock_granola.get_folders.return_value = [
-            {
-                "id": "f1",
-                "title": "SQP",
-                "documents": [
-                    {
-                        "id": "doc1",
-                        "title": "Sprint Planning",
-                        "created_at": "2026-01-17T10:00:00Z",
-                        "people": [],
-                        "last_viewed_panel": {"content": {}},
-                    },
-                ],
-            },
-        ]
+        docs = [_make_doc("doc1", "Sprint Planning", "Notes")]
+        mock_granola.get_documents_by_folder.return_value = docs
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}),
+            sync=config.sync,
+            state=config.state,
         )
         summary = await service.sync_once(dry_run=True)
 
@@ -240,21 +234,8 @@ class TestSyncService:
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
         """Test handling of webhook failures."""
-        mock_granola.get_folders.return_value = [
-            {
-                "id": "f1",
-                "title": "SQP",
-                "documents": [
-                    {
-                        "id": "doc1",
-                        "title": "Sprint Planning",
-                        "created_at": "2026-01-17T10:00:00Z",
-                        "people": [],
-                        "last_viewed_panel": {"content": {}},
-                    },
-                ],
-            },
-        ]
+        docs = [_make_doc("doc1", "Sprint Planning", "Notes")]
+        mock_granola.get_documents_by_folder.return_value = docs
         mock_granola.get_transcript.return_value = []
         mock_webhook.send.side_effect = httpx.HTTPStatusError(
             "Server error",
@@ -264,6 +245,12 @@ class TestSyncService:
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}, include_transcript=True),
+            sync=config.sync,
+            state=config.state,
         )
         summary = await service.sync_once()
 
@@ -275,33 +262,226 @@ class TestSyncService:
         self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
     ):
         """Test batch size limits documents processed."""
-        # Create 10 documents but batch size is 5
-        mock_granola.get_folders.return_value = [
-            {
-                "id": "f1",
-                "title": "SQP",
-                "documents": [
-                    {
-                        "id": f"doc{i}",
-                        "title": f"Meeting {i}",
-                        "created_at": "2026-01-17T10:00:00Z",
-                        "people": [],
-                        "last_viewed_panel": {"content": {}},
-                    }
-                    for i in range(10)
-                ],
-            },
-        ]
+        docs = [_make_doc(f"doc{i}", f"Meeting {i}", f"Notes {i}") for i in range(10)]
+        mock_granola.get_documents_by_folder.return_value = docs
         mock_granola.get_transcript.return_value = []
 
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}, include_transcript=True),
+            sync=SyncConfig(interval=60, batch_size=5, retry_attempts=2, retry_delay=0),
+            state=config.state,
         )
         summary = await service.sync_once()
 
         assert summary["documents_new"] == 10
         assert summary["documents_synced"] == 5  # Limited by batch_size
         assert mock_webhook.send.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_sync_once_pending_content(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Test documents without content are marked as pending."""
+        # Document with no notes content
+        empty_doc = _make_doc("doc1", "In Progress Meeting", notes_markdown="", notes_plain="",
+                              notes={"type": "doc", "content": [{"type": "paragraph"}]})
+        mock_granola.get_documents_by_folder.return_value = [empty_doc]
+
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}),
+            sync=config.sync,
+            state=config.state,
+        )
+        summary = await service.sync_once()
+
+        assert summary["documents_pending"] == 1
+        assert summary["documents_synced"] == 0
+        assert state_manager.is_document_pending("doc1")
+        mock_webhook.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recheck_pending_syncs_when_content_appears(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Test that pending documents are synced when content appears."""
+        # Pre-mark document as pending
+        state_manager.mark_pending("doc1", {"title": "Meeting"}, "SQP")
+
+        # API now returns the document with content
+        doc_with_content = _make_doc("doc1", "Meeting", "Now has notes!")
+        mock_granola.get_documents.return_value = [doc_with_content]
+        mock_granola.get_documents_by_folder.return_value = []
+        mock_granola.get_transcript.return_value = []
+
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}, include_transcript=True),
+            sync=config.sync,
+            state=config.state,
+        )
+        summary = await service.sync_once()
+
+        # The pending document should have been synced during recheck
+        assert summary["documents_synced"] == 1
+        assert not state_manager.is_document_pending("doc1")
+
+    @pytest.mark.asyncio
+    async def test_api_fallback_to_cache(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Test that API failure falls back to cache for documents."""
+        mock_granola.get_documents_by_folder.side_effect = httpx.HTTPStatusError(
+            "Server error", request=MagicMock(), response=MagicMock(status_code=500)
+        )
+
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={"SQP": "sqp-folder-id"}),
+            sync=config.sync,
+            state=config.state,
+        )
+
+        cache_docs = [_make_doc("doc1", "Cached Meeting", "Cached notes")]
+        with patch("granola_sync.sync.GranolaCacheReader") as mock_cache_cls:
+            mock_cache_cls.return_value.get_folder_map.return_value = {}
+            mock_cache_cls.return_value.get_documents_for_folder.return_value = cache_docs
+            mock_granola.get_transcript.return_value = []
+            summary = await service.sync_once()
+
+        assert summary["documents_found"] == 1
+        assert summary["documents_synced"] == 1
+
+
+class TestFolderMapResolution:
+    """Tests for folder name → ID resolution."""
+
+    @pytest.mark.asyncio
+    async def test_config_folder_ids_take_priority(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Test that config folder_ids override all other sources."""
+        # State has a different ID for SQP
+        state_manager.update_folder_map({"SQP": "old-state-id"})
+
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        folder_map = service._resolve_folder_map()
+
+        # Config value should win
+        assert folder_map["SQP"] == "sqp-folder-id"
+
+    @pytest.mark.asyncio
+    async def test_state_folder_map_used_when_no_config(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Test state folder map is used when config has no folder_ids."""
+        state_manager.update_folder_map({"SQP": "state-folder-id"})
+
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={}),
+            sync=config.sync,
+            state=config.state,
+        )
+
+        with patch("granola_sync.sync.GranolaCacheReader") as mock_cache_cls:
+            mock_cache_cls.return_value.get_folder_map.side_effect = FileNotFoundError("no cache")
+            folder_map = service._resolve_folder_map()
+
+        assert folder_map["SQP"] == "state-folder-id"
+
+    @pytest.mark.asyncio
+    async def test_cache_folder_map_persists_to_state(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Test that cache-derived folder map is persisted in state."""
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["SQP"], folder_ids={}),
+            sync=config.sync,
+            state=config.state,
+        )
+
+        with patch("granola_sync.sync.GranolaCacheReader") as mock_cache_cls:
+            mock_cache_cls.return_value.get_folder_map.return_value = {"SQP": "cache-folder-id"}
+            folder_map = service._resolve_folder_map()
+
+        assert folder_map["SQP"] == "cache-folder-id"
+        assert state_manager.get_folder_map()["SQP"] == "cache-folder-id"
+
+
+class TestContentDetection:
+    """Tests for _has_content and content gating."""
+
+    @pytest.fixture
+    def service(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ) -> SyncService:
+        return SyncService(config, granola=mock_granola, webhook=mock_webhook, state=state_manager)
+
+    def test_has_content_with_markdown(self, service: SyncService):
+        """Test document with notes_markdown is detected as having content."""
+        doc = _make_doc(notes_markdown="Some notes")
+        assert service._has_content(doc) is True
+
+    def test_has_content_with_plain_text(self, service: SyncService):
+        """Test document with notes_plain is detected as having content."""
+        doc = _make_doc(notes_markdown="", notes_plain="Some plain text")
+        assert service._has_content(doc) is True
+
+    def test_has_content_with_prosemirror(self, service: SyncService):
+        """Test document with ProseMirror text is detected as having content."""
+        doc = _make_doc(
+            notes_markdown="", notes_plain="",
+            notes={"type": "doc", "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Real content"}]}
+            ]},
+        )
+        assert service._has_content(doc) is True
+
+    def test_no_content_empty_prosemirror(self, service: SyncService):
+        """Test document with empty ProseMirror is detected as no content."""
+        doc = _make_doc(
+            notes_markdown="", notes_plain="",
+            notes={"type": "doc", "content": [{"type": "paragraph"}]},
+        )
+        assert service._has_content(doc) is False
+
+    def test_no_content_all_empty(self, service: SyncService):
+        """Test document with no notes at all."""
+        doc = {"id": "doc1", "title": "Empty", "notes_markdown": "", "notes_plain": "", "notes": None}
+        assert service._has_content(doc) is False
+
+    def test_has_content_with_last_viewed_panel_string(self, service: SyncService):
+        """Test document with string content in last_viewed_panel."""
+        doc = {
+            "id": "doc1", "title": "Test",
+            "notes_markdown": "", "notes_plain": "",
+            "notes": {"type": "doc", "content": [{"type": "paragraph"}]},
+            "last_viewed_panel": {"content": "Some cached content"},
+        }
+        assert service._has_content(doc) is True
 
 
 class TestBuildPayload:
@@ -361,6 +541,32 @@ class TestBuildPayload:
         assert "Me: Hello everyone" in payload["transcript"]
         assert "Them: Hi there" in payload["transcript"]
         assert "Me: Let's begin" in payload["transcript"]
+
+    @pytest.mark.asyncio
+    async def test_build_payload_with_new_api_people(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Test payload handles new API people structure (dict with attendees)."""
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+
+        doc = {
+            "id": "doc123",
+            "title": "Meeting",
+            "created_at": "2026-01-17T10:00:00Z",
+            "people": {
+                "attendees": [
+                    {"name": "Alice", "email": "alice@example.com"},
+                    {"name": "", "email": "bob@example.com"},
+                ],
+            },
+            "last_viewed_panel": {"content": {}},
+        }
+
+        payload = service._build_payload(doc, "SQP", None)
+        assert "Alice" in payload["participants"]
+        assert "bob@example.com" in payload["participants"]
 
 
 class TestProseMirrorToText:

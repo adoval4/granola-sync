@@ -207,6 +207,20 @@ class GranolaCacheReader:
                 return folder["documents"]
         return []
 
+    def get_folder_map(self) -> dict[str, str]:
+        """Return a mapping of folder title to folder ID from the cache.
+
+        Returns:
+            Dict mapping folder titles to their IDs
+        """
+        state = self.read_cache()
+        metadata = state.get("documentListsMetadata", {})
+        return {
+            meta.get("title", ""): list_id
+            for list_id, meta in metadata.items()
+            if meta.get("title")
+        }
+
 
 class GranolaClient:
     """Client for interacting with the Granola API."""
@@ -284,6 +298,37 @@ class GranolaClient:
                 f"Failed to load folders. "
                 f"Cache error: {cache_error}; API error: {api_error}"
             ) from api_error
+
+    async def get_documents_by_folder(
+        self, list_id: str, limit: int = 100, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Get documents for a specific folder via the API.
+
+        Args:
+            list_id: The folder/list ID to filter by
+            limit: Maximum number of documents to fetch
+            offset: Number of documents to skip (for pagination)
+
+        Returns:
+            List of document objects in the folder
+        """
+        client = await self._get_client()
+        logger.debug("fetching_documents_by_folder", list_id=list_id, limit=limit, offset=offset)
+
+        response = await client.post(
+            "/v2/get-documents",
+            json={
+                "list_id": list_id,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        documents = data.get("docs", []) if isinstance(data, dict) else data
+        logger.debug("folder_documents_fetched", list_id=list_id, count=len(documents))
+        return documents
 
     async def get_documents(
         self, limit: int = 100, offset: int = 0, include_last_viewed_panel: bool = True

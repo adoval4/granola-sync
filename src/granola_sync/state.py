@@ -26,11 +26,13 @@ class StateManager:
     def _default_state(self) -> dict[str, Any]:
         """Get the default state structure."""
         return {
-            "version": 1,
+            "version": 2,
             "last_sync": None,
             "folders": {},
+            "folder_map": {},
             "seen_documents": {},
             "failed_documents": {},
+            "pending_documents": {},
             "stats": {
                 "total_synced": 0,
                 "total_errors": 0,
@@ -49,10 +51,20 @@ class StateManager:
             with open(self.state_file) as f:
                 data = json.load(f)
             self._state = data
+            self._migrate()
             logger.debug("state_loaded", path=str(self.state_file))
         except (json.JSONDecodeError, IOError) as e:
             logger.warning("state_load_error", error=str(e), path=str(self.state_file))
             # Keep default state
+
+    def _migrate(self) -> None:
+        """Migrate state from older versions."""
+        version = self._state.get("version", 1)
+        if version < 2:
+            self._state.setdefault("folder_map", {})
+            self._state.setdefault("pending_documents", {})
+            self._state["version"] = 2
+            logger.info("state_migrated", from_version=version, to_version=2)
 
     def save(self) -> None:
         """Save state to file."""
@@ -211,6 +223,79 @@ class StateManager:
             Set of document IDs
         """
         return set(self._state["seen_documents"].keys())
+
+    def get_folder_map(self) -> dict[str, str]:
+        """Get the persisted folder name → ID mapping.
+
+        Returns:
+            Dict mapping folder titles to their IDs
+        """
+        return self._state.get("folder_map", {}).copy()
+
+    def update_folder_map(self, mapping: dict[str, str]) -> None:
+        """Merge new folder name → ID entries into the persisted map.
+
+        Args:
+            mapping: Dict mapping folder titles to their IDs
+        """
+        self._state.setdefault("folder_map", {}).update(mapping)
+        logger.debug("folder_map_updated", count=len(mapping))
+
+    def mark_pending(
+        self,
+        doc_id: str,
+        doc: dict[str, Any],
+        folder_name: str,
+    ) -> None:
+        """Mark a document as pending content (has no notes yet).
+
+        Args:
+            doc_id: The document ID
+            doc: The document data
+            folder_name: The folder the document belongs to
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self._state["pending_documents"].get(doc_id, {})
+
+        self._state["pending_documents"][doc_id] = {
+            "title": doc.get("title", "Untitled"),
+            "folder_name": folder_name,
+            "first_seen": existing.get("first_seen", now),
+            "last_checked": now,
+            "check_count": existing.get("check_count", 0) + 1,
+        }
+        logger.debug("document_marked_pending", doc_id=doc_id, folder=folder_name)
+
+    def get_pending_documents(self) -> list[dict[str, Any]]:
+        """Get all documents pending content.
+
+        Returns:
+            List of pending document info dicts (includes doc_id key)
+        """
+        return [
+            {"doc_id": doc_id, **info}
+            for doc_id, info in self._state.get("pending_documents", {}).items()
+        ]
+
+    def clear_pending(self, doc_id: str) -> None:
+        """Remove a document from the pending list.
+
+        Args:
+            doc_id: The document ID to clear
+        """
+        self._state.get("pending_documents", {}).pop(doc_id, None)
+        logger.debug("pending_cleared", doc_id=doc_id)
+
+    def is_document_pending(self, doc_id: str) -> bool:
+        """Check if a document is in the pending content list.
+
+        Args:
+            doc_id: The document ID
+
+        Returns:
+            True if the document is pending content
+        """
+        return doc_id in self._state.get("pending_documents", {})
 
     def clear(self) -> None:
         """Clear all state (useful for testing or resetting)."""

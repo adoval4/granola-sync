@@ -303,6 +303,45 @@ class TestGranolaCacheReader:
         await client.close()
 
 
+class TestGranolaCacheReaderFolderMap:
+    """Tests for GranolaCacheReader.get_folder_map."""
+
+    @pytest.fixture
+    def cache_dir(self, tmp_path: Path):
+        granola_dir = tmp_path / "Library" / "Application Support" / "Granola"
+        granola_dir.mkdir(parents=True)
+        return granola_dir
+
+    def test_get_folder_map(self, cache_dir: Path):
+        """Test get_folder_map returns title→id mapping."""
+        state = _make_cache_state(folder_title="Sales Calls")
+        _write_v4_cache(cache_dir, state)
+
+        reader = GranolaCacheReader()
+        with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
+            folder_map = reader.get_folder_map()
+
+        assert folder_map == {"Sales Calls": "folder1"}
+
+    def test_get_folder_map_multiple_folders(self, cache_dir: Path):
+        """Test get_folder_map with multiple folders."""
+        state = {
+            "documentListsMetadata": {
+                "f1": {"id": "f1", "title": "SQP"},
+                "f2": {"id": "f2", "title": "CLIENT-A"},
+            },
+            "documentLists": {"f1": [], "f2": []},
+            "documents": {},
+        }
+        _write_v4_cache(cache_dir, state)
+
+        reader = GranolaCacheReader()
+        with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
+            folder_map = reader.get_folder_map()
+
+        assert folder_map == {"SQP": "f1", "CLIENT-A": "f2"}
+
+
 class TestGranolaClient:
     """Tests for GranolaClient class."""
 
@@ -414,6 +453,30 @@ class TestGranolaClient:
 
         with pytest.raises(httpx.HTTPStatusError):
             await client.get_documents()
+
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_get_documents_by_folder(self, client):
+        """Test fetching documents filtered by folder/list ID."""
+        mock_docs = [
+            {"id": "doc1", "title": "Meeting in Folder", "created_at": "2026-01-17T10:00:00Z"},
+        ]
+
+        route = respx.post("https://api.granola.ai/v2/get-documents")
+        route.mock(return_value=httpx.Response(200, json={"docs": mock_docs}))
+
+        documents = await client.get_documents_by_folder("folder-123", limit=50)
+
+        assert len(documents) == 1
+        assert documents[0]["title"] == "Meeting in Folder"
+
+        # Verify the request included list_id
+        request = route.calls[0].request
+        body = json.loads(request.content)
+        assert body["list_id"] == "folder-123"
+        assert body["limit"] == 50
 
         await client.close()
 

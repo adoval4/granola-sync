@@ -6,7 +6,7 @@ from typing import Any, Optional
 import structlog
 
 from .config import Config
-from .granola_api import GranolaClient
+from .granola_api import GranolaCacheReader, GranolaClient
 from .state import StateManager
 from .webhook import WebhookSender
 
@@ -61,6 +61,9 @@ class SyncService:
     async def sync_once(self, dry_run: bool = False) -> dict[str, Any]:
         """Perform a single sync cycle across all configured folders.
 
+        Uses the Granola API as the primary data source for real-time freshness,
+        with the local cache as a fallback when the API is unavailable.
+
         Args:
             dry_run: If True, don't send webhooks, just report what would be synced
 
@@ -76,32 +79,31 @@ class SyncService:
             "documents_new": 0,
             "documents_synced": 0,
             "documents_failed": 0,
+            "documents_pending": 0,
             "by_folder": {},
         }
 
         try:
-            # 1. Get all folders (includes documents)
-            all_folders = await self.granola.get_folders()
+            # 1. Resolve folder name → ID mapping
+            folder_map = self._resolve_folder_map()
 
-            # 2. Build a lookup by folder title
-            folder_lookup = {f["title"]: f for f in all_folders}
-
-            # 3. Process each configured folder
+            # 2. Process each configured folder
             for folder_name in configured_folders:
-                folder = folder_lookup.get(folder_name)
-                if not folder:
-                    logger.warning("folder_not_found", name=folder_name)
+                folder_id = folder_map.get(folder_name)
+                if not folder_id:
+                    logger.warning("folder_id_not_resolved", name=folder_name)
                     summary["by_folder"][folder_name] = {
                         "total": 0,
                         "new": 0,
                         "synced": 0,
                         "failed": 0,
+                        "pending": 0,
                         "documents": [],
                     }
                     continue
 
-                # Get documents from this folder
-                documents = folder.get("documents", [])
+                # Fetch documents from API with cache fallback
+                documents = await self._fetch_folder_documents(folder_name, folder_id)
                 summary["documents_found"] += len(documents)
 
                 # Sync documents in this folder
@@ -112,6 +114,12 @@ class SyncService:
                 summary["documents_new"] += folder_summary["new"]
                 summary["documents_synced"] += folder_summary["synced"]
                 summary["documents_failed"] += folder_summary["failed"]
+                summary["documents_pending"] += folder_summary.get("pending", 0)
+
+            # 3. Re-check documents that were previously pending content
+            pending_summary = await self._recheck_pending_documents(dry_run=dry_run)
+            summary["documents_synced"] += pending_summary["synced"]
+            summary["documents_failed"] += pending_summary["failed"]
 
             # 4. Save state (unless dry run)
             if not dry_run:
@@ -124,6 +132,7 @@ class SyncService:
                 new=summary["documents_new"],
                 synced=summary["documents_synced"],
                 failed=summary["documents_failed"],
+                pending=summary["documents_pending"],
             )
 
         except Exception as e:
@@ -131,6 +140,77 @@ class SyncService:
             raise
 
         return summary
+
+    def _resolve_folder_map(self) -> dict[str, str]:
+        """Resolve folder names to IDs from multiple sources.
+
+        Priority order:
+        1. Explicit IDs from config.yaml (folder_ids)
+        2. Persisted mapping from state.json (folder_map)
+        3. Live read from cache-v4.json (updates state)
+
+        Returns:
+            Dict mapping folder titles to their IDs
+        """
+        folder_map: dict[str, str] = {}
+
+        # Priority 3 (lowest): Read from cache file
+        try:
+            cache = GranolaCacheReader()
+            cache_map = cache.get_folder_map()
+            folder_map.update(cache_map)
+            # Persist for future use even if cache becomes unavailable
+            self.state.update_folder_map(cache_map)
+            logger.debug("folder_map_from_cache", count=len(cache_map))
+        except Exception as e:
+            logger.debug("folder_map_cache_unavailable", error=str(e))
+
+        # Priority 2: Persisted mapping from state (overrides cache if present)
+        state_map = self.state.get_folder_map()
+        folder_map.update(state_map)
+
+        # Priority 1 (highest): Explicit config overrides
+        if self.config.granola.folder_ids:
+            folder_map.update(self.config.granola.folder_ids)
+            logger.debug("folder_map_from_config", count=len(self.config.granola.folder_ids))
+
+        return folder_map
+
+    async def _fetch_folder_documents(
+        self, folder_name: str, folder_id: str
+    ) -> list[dict[str, Any]]:
+        """Fetch documents for a folder, API-first with cache fallback.
+
+        Args:
+            folder_name: The folder title (for cache fallback)
+            folder_id: The folder/list ID (for API call)
+
+        Returns:
+            List of document objects
+        """
+        try:
+            documents = await self.granola.get_documents_by_folder(folder_id)
+            logger.debug("documents_from_api", folder=folder_name, count=len(documents))
+            return documents
+        except Exception as api_error:
+            logger.warning(
+                "api_fetch_failed_using_cache",
+                folder=folder_name,
+                error=str(api_error),
+            )
+            try:
+                cache = GranolaCacheReader()
+                documents = cache.get_documents_for_folder(folder_name)
+                logger.debug("documents_from_cache", folder=folder_name, count=len(documents))
+                return documents
+            except Exception as cache_error:
+                logger.error(
+                    "both_sources_failed",
+                    folder=folder_name,
+                    api_error=str(api_error),
+                    cache_error=str(cache_error),
+                )
+                return []
 
     async def _sync_documents(
         self,
@@ -153,6 +233,7 @@ class SyncService:
             "new": 0,
             "synced": 0,
             "failed": 0,
+            "pending": 0,
             "documents": [],
         }
 
@@ -177,6 +258,21 @@ class SyncService:
                     "action": "would_sync",
                 })
                 summary["synced"] += 1
+            elif not self._has_content(doc):
+                # No content yet — mark as pending for re-check later
+                self.state.mark_pending(doc["id"], doc, folder_label)
+                summary["documents"].append({
+                    "id": doc["id"],
+                    "title": doc.get("title", "Untitled"),
+                    "action": "pending_content",
+                })
+                summary["pending"] += 1
+                logger.info(
+                    "document_pending_content",
+                    doc_id=doc["id"],
+                    title=doc.get("title"),
+                    folder=folder_label,
+                )
             else:
                 success = await self._process_document(doc, folder_label)
                 summary["documents"].append({
@@ -216,6 +312,113 @@ class SyncService:
                 new_docs.append(doc)
 
         return new_docs
+
+    def _has_content(self, doc: dict[str, Any]) -> bool:
+        """Check if a document has meaningful note content.
+
+        Args:
+            doc: The document data
+
+        Returns:
+            True if the document has notes content to sync
+        """
+        if doc.get("notes_markdown"):
+            return True
+        if doc.get("notes_plain"):
+            return True
+        # Check ProseMirror notes dict for actual text
+        notes = doc.get("notes")
+        if isinstance(notes, dict) and self._prosemirror_has_text(notes):
+            return True
+        # Check last_viewed_panel content (cache format)
+        last_viewed_panel = doc.get("last_viewed_panel") or {}
+        content = last_viewed_panel.get("content") if isinstance(last_viewed_panel, dict) else None
+        if isinstance(content, str) and content.strip():
+            return True
+        if isinstance(content, dict) and self._prosemirror_has_text(content):
+            return True
+        return False
+
+    def _prosemirror_has_text(self, node: dict[str, Any]) -> bool:
+        """Check if a ProseMirror node tree contains any actual text.
+
+        Args:
+            node: ProseMirror node dict
+
+        Returns:
+            True if the node tree contains text content
+        """
+        if not node:
+            return False
+        if node.get("type") == "text" and node.get("text", "").strip():
+            return True
+        for child in node.get("content", []):
+            if isinstance(child, dict) and self._prosemirror_has_text(child):
+                return True
+        return False
+
+    async def _recheck_pending_documents(
+        self, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """Re-check documents previously skipped due to missing content.
+
+        Fetches each pending document from the API and processes it
+        if content has appeared since it was first seen.
+
+        Args:
+            dry_run: If True, don't send webhooks
+
+        Returns:
+            Summary with synced/failed counts
+        """
+        result: dict[str, Any] = {"synced": 0, "failed": 0}
+        pending = self.state.get_pending_documents()
+
+        if not pending:
+            return result
+
+        logger.info("rechecking_pending_documents", count=len(pending))
+
+        for doc_info in pending:
+            doc_id = doc_info["doc_id"]
+            folder_name = doc_info["folder_name"]
+
+            try:
+                # Fetch the latest version from the API
+                docs = await self.granola.get_documents(limit=100, offset=0)
+                doc = next((d for d in docs if d.get("id") == doc_id), None)
+
+                if doc and self._has_content(doc):
+                    if dry_run:
+                        result["synced"] += 1
+                    else:
+                        success = await self._process_document(doc, folder_name)
+                        if success:
+                            self.state.clear_pending(doc_id)
+                            result["synced"] += 1
+                            logger.info(
+                                "pending_document_synced",
+                                doc_id=doc_id,
+                                title=doc.get("title"),
+                            )
+                        else:
+                            result["failed"] += 1
+                else:
+                    # Still no content — update check timestamp
+                    if not dry_run:
+                        self.state.mark_pending(
+                            doc_id,
+                            {"title": doc_info.get("title", "Untitled")},
+                            folder_name,
+                        )
+                    logger.debug("pending_document_still_empty", doc_id=doc_id)
+
+            except Exception as e:
+                logger.warning(
+                    "pending_recheck_error", doc_id=doc_id, error=str(e)
+                )
+
+        return result
 
     async def _process_document(self, doc: dict[str, Any], folder_name: str) -> bool:
         """Process a single document: fetch details and send webhook.

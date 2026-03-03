@@ -18,6 +18,7 @@ class GranolaConfig(BaseModel):
     """Granola API configuration."""
 
     folders: list[str] = Field(default_factory=list)
+    folder_ids: dict[str, str] = Field(default_factory=dict)
     include_transcript: bool = True
 
 
