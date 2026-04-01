@@ -36,7 +36,7 @@ granola-sync --help
 ### Key components
 
 - **`sync.py` — SyncService**: Orchestrates sync cycles. Resolves folders, fetches documents (API-first, cache fallback), gates on content availability, sends webhooks. Documents without notes are marked `pending_content` and re-checked next cycle.
-- **`granola_api.py` — GranolaClient + GranolaCacheReader**: API client with auto token refresh. Cache reader handles `cache-v4.json` (fallback to v3) for folder ID resolution and document fallback.
+- **`granola_api.py` — GranolaClient + GranolaCacheReader**: API client with auto token refresh. Cache reader auto-discovers `cache-v*.json` (newest first, with structure validation) for folder ID resolution and document fallback.
 - **`state.py` — StateManager**: JSON-based persistent state tracking synced/failed/pending documents and folder ID mappings. Auto-migrates v1 → v2 schema.
 - **`webhook.py` — WebhookSender**: HMAC-SHA256 signed payloads with configurable retry/backoff.
 - **`config.py`**: Pydantic models validated from `~/.granola-sync/config.yaml`.
@@ -65,4 +65,4 @@ granola-sync --help
 
 - Config: `~/.granola-sync/config.yaml` (mode 0600)
 - State: `~/.granola-sync/state.json`
-- Granola data (macOS): `~/Library/Application Support/Granola/` — `supabase.json` (auth), `cache-v4.json` (cache)
+- Granola data (macOS): `~/Library/Application Support/Granola/` — `supabase.json` (auth), `cache-v*.json` (cache, auto-discovered)

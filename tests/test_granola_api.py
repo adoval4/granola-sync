@@ -10,7 +10,6 @@ import pytest
 import respx
 
 from granola_sync.granola_api import (
-    CACHE_FILENAMES,
     GranolaCacheReader,
     GranolaClient,
     _get_granola_app_dir,
@@ -185,22 +184,23 @@ def _make_cache_state(doc_id="doc1", folder_title="Sales Calls"):
     }
 
 
-def _write_v3_cache(cache_dir: Path, state: dict) -> Path:
-    """Write a v3-style cache file (cache field is a JSON string)."""
-    path = cache_dir / "cache-v3.json"
-    path.write_text(json.dumps({"cache": json.dumps({"state": state, "version": 3})}))
-    return path
+def _write_cache(cache_dir: Path, state: dict, version: int, *, json_string_wrap: bool = False) -> Path:
+    """Write a cache-v{version}.json file.
 
-
-def _write_v4_cache(cache_dir: Path, state: dict) -> Path:
-    """Write a v4-style cache file (cache field is a dict)."""
-    path = cache_dir / "cache-v4.json"
-    path.write_text(json.dumps({"cache": {"state": state, "version": 4}}))
+    Args:
+        json_string_wrap: If True, encode the cache field as a JSON string (v3-style).
+    """
+    path = cache_dir / f"cache-v{version}.json"
+    inner = {"state": state, "version": version}
+    if json_string_wrap:
+        path.write_text(json.dumps({"cache": json.dumps(inner)}))
+    else:
+        path.write_text(json.dumps({"cache": inner}))
     return path
 
 
 class TestGranolaCacheReader:
-    """Tests for GranolaCacheReader with v3 and v4 cache formats."""
+    """Tests for GranolaCacheReader with auto-discovered cache files."""
 
     @pytest.fixture
     def cache_dir(self, tmp_path: Path):
@@ -209,22 +209,10 @@ class TestGranolaCacheReader:
         granola_dir.mkdir(parents=True)
         return granola_dir
 
-    @pytest.fixture
-    def reader(self, tmp_path: Path):
-        """Create a GranolaCacheReader patched to use tmp_path."""
-        r = GranolaCacheReader()
-        with patch("granola_sync.granola_api._get_granola_app_dir", return_value=tmp_path / "Library" / "Application Support" / "Granola"):
-            yield r
-
-    def _patched_read(self, reader, tmp_path):
-        """Helper: call reader methods with patched app dir."""
-        with patch("granola_sync.granola_api._get_granola_app_dir", return_value=tmp_path / "Library" / "Application Support" / "Granola"):
-            return reader.read_cache()
-
-    def test_read_v3_cache(self, cache_dir: Path, tmp_path: Path):
+    def test_read_v3_cache_json_string_wrapped(self, cache_dir: Path):
         """Test reading v3 cache (JSON-string-wrapped)."""
         state = _make_cache_state()
-        _write_v3_cache(cache_dir, state)
+        _write_cache(cache_dir, state, 3, json_string_wrap=True)
 
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
@@ -233,9 +221,9 @@ class TestGranolaCacheReader:
         assert result["documents"]["doc1"]["title"] == "Meeting notes"
 
     def test_read_v4_cache(self, cache_dir: Path):
-        """Test reading v4 cache (dict-style, no JSON string wrapping)."""
+        """Test reading v4 cache (dict-style)."""
         state = _make_cache_state()
-        _write_v4_cache(cache_dir, state)
+        _write_cache(cache_dir, state, 4)
 
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
@@ -243,23 +231,33 @@ class TestGranolaCacheReader:
 
         assert result["documents"]["doc1"]["title"] == "Meeting notes"
 
-    def test_prefers_v4_over_v3(self, cache_dir: Path):
-        """When both v3 and v4 exist, v4 is preferred."""
-        state_v3 = _make_cache_state(folder_title="Old Folder")
-        state_v4 = _make_cache_state(folder_title="New Folder")
-        _write_v3_cache(cache_dir, state_v3)
-        _write_v4_cache(cache_dir, state_v4)
+    def test_discovers_v6_cache(self, cache_dir: Path):
+        """Test that v6 cache is auto-discovered and read."""
+        state = _make_cache_state(folder_title="V6 Folder")
+        _write_cache(cache_dir, state, 6)
 
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
             folders = reader.get_folders()
 
-        assert folders[0]["title"] == "New Folder"
+        assert folders[0]["title"] == "V6 Folder"
 
-    def test_falls_back_to_v3(self, cache_dir: Path):
-        """When v4 is missing, falls back to v3."""
+    def test_prefers_highest_version(self, cache_dir: Path):
+        """When multiple cache versions exist, the highest version is used."""
+        _write_cache(cache_dir, _make_cache_state(folder_title="Old V3"), 3, json_string_wrap=True)
+        _write_cache(cache_dir, _make_cache_state(folder_title="Mid V4"), 4)
+        _write_cache(cache_dir, _make_cache_state(folder_title="New V6"), 6)
+
+        reader = GranolaCacheReader()
+        with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
+            folders = reader.get_folders()
+
+        assert folders[0]["title"] == "New V6"
+
+    def test_falls_back_to_older_version(self, cache_dir: Path):
+        """When only an older version exists, it is used."""
         state = _make_cache_state(folder_title="V3 Folder")
-        _write_v3_cache(cache_dir, state)
+        _write_cache(cache_dir, state, 3, json_string_wrap=True)
 
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
@@ -267,17 +265,31 @@ class TestGranolaCacheReader:
 
         assert folders[0]["title"] == "V3 Folder"
 
-    def test_no_cache_raises_with_all_paths(self, cache_dir: Path):
-        """When no cache file exists, error message lists all paths tried."""
+    def test_skips_invalid_structure(self, cache_dir: Path):
+        """Cache files missing required keys are skipped, falls back to next."""
+        # v6 has no documents/documentListsMetadata — invalid
+        invalid_state = {"somethingElse": {}}
+        _write_cache(cache_dir, invalid_state, 6)
+        # v4 is valid
+        _write_cache(cache_dir, _make_cache_state(folder_title="Valid V4"), 4)
+
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
-            with pytest.raises(FileNotFoundError, match="cache-v4.json"):
+            folders = reader.get_folders()
+
+        assert folders[0]["title"] == "Valid V4"
+
+    def test_no_cache_files_raises(self, cache_dir: Path):
+        """When no cache-v*.json files exist, raises FileNotFoundError."""
+        reader = GranolaCacheReader()
+        with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
+            with pytest.raises(FileNotFoundError, match="No Granola cache files"):
                 reader.read_cache()
 
-    def test_get_folders_from_v4_cache(self, cache_dir: Path):
-        """End-to-end: get_folders works with v4 cache."""
+    def test_get_folders_end_to_end(self, cache_dir: Path):
+        """End-to-end: get_folders works with auto-discovered cache."""
         state = _make_cache_state(doc_id="d1", folder_title="Standups")
-        _write_v4_cache(cache_dir, state)
+        _write_cache(cache_dir, state, 6)
 
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
@@ -315,7 +327,7 @@ class TestGranolaCacheReaderFolderMap:
     def test_get_folder_map(self, cache_dir: Path):
         """Test get_folder_map returns title→id mapping."""
         state = _make_cache_state(folder_title="Sales Calls")
-        _write_v4_cache(cache_dir, state)
+        _write_cache(cache_dir, state, 6)
 
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):
@@ -333,7 +345,7 @@ class TestGranolaCacheReaderFolderMap:
             "documentLists": {"f1": [], "f2": []},
             "documents": {},
         }
-        _write_v4_cache(cache_dir, state)
+        _write_cache(cache_dir, state, 6)
 
         reader = GranolaCacheReader()
         with patch("granola_sync.granola_api._get_granola_app_dir", return_value=cache_dir):

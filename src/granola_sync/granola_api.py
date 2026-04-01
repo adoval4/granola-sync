@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -13,7 +14,8 @@ logger = structlog.get_logger()
 
 GRANOLA_API_BASE = "https://api.granola.ai"
 TOKEN_REFRESH_BUFFER_SECONDS = 300  # Refresh 5 minutes before expiration
-CACHE_FILENAMES = ["cache-v4.json", "cache-v3.json"]
+REQUIRED_CACHE_KEYS = {"documents", "documentListsMetadata"}
+_CACHE_VERSION_RE = re.compile(r"^cache-v(\d+)\.json$")
 
 
 def _get_granola_app_dir() -> Path:
@@ -148,35 +150,55 @@ class GranolaCacheReader:
     """Reads folder and document data from the local Granola app cache."""
 
     def get_cache_paths(self) -> list[Path]:
-        """Return candidate cache paths, newest format first."""
+        """Auto-discover cache-v*.json files, newest version first."""
         app_dir = _get_granola_app_dir()
-        return [app_dir / name for name in CACHE_FILENAMES]
+        candidates: list[tuple[int, Path]] = []
+        if app_dir.is_dir():
+            for p in app_dir.iterdir():
+                m = _CACHE_VERSION_RE.match(p.name)
+                if m:
+                    candidates.append((int(m.group(1)), p))
+        candidates.sort(reverse=True)
+        return [p for _, p in candidates]
 
-    def read_cache(self) -> dict:
-        paths = self.get_cache_paths()
-
-        outer = None
-        for cache_path in paths:
-            if cache_path.exists():
-                logger.debug("reading_cache", path=str(cache_path))
-                with open(cache_path) as f:
-                    outer = json.load(f)
-                break
-
-        if outer is None:
-            raise FileNotFoundError(
-                f"Granola cache not found. Looked in: {', '.join(str(p) for p in paths)}"
-            )
-
-        # Structure: {"cache": "<JSON string>" | {dict}} -> {"state": {...}, "version": N}
-        cache = outer.get("cache", outer)
+    @staticmethod
+    def _parse_cache_state(raw: dict) -> dict:
+        """Extract the state dict from a raw cache file's JSON."""
+        cache = raw.get("cache", raw)
         if isinstance(cache, str):
             cache = json.loads(cache)
-
         state = cache.get("state", cache)
         if isinstance(state, str):
             state = json.loads(state)
         return state
+
+    def read_cache(self) -> dict:
+        paths = self.get_cache_paths()
+        if not paths:
+            app_dir = _get_granola_app_dir()
+            raise FileNotFoundError(
+                f"No Granola cache files (cache-v*.json) found in {app_dir}"
+            )
+
+        for cache_path in paths:
+            try:
+                logger.debug("reading_cache", path=str(cache_path))
+                with open(cache_path) as f:
+                    raw = json.load(f)
+                state = self._parse_cache_state(raw)
+                if REQUIRED_CACHE_KEYS.issubset(state):
+                    return state
+                logger.warning(
+                    "cache_structure_invalid",
+                    path=str(cache_path),
+                    missing_keys=list(REQUIRED_CACHE_KEYS - state.keys()),
+                )
+            except Exception as e:
+                logger.warning("cache_read_failed", path=str(cache_path), error=str(e))
+
+        raise FileNotFoundError(
+            f"No valid Granola cache found. Tried: {', '.join(str(p) for p in paths)}"
+        )
 
     def get_folders(self) -> list[dict[str, Any]]:
         state = self.read_cache()

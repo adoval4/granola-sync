@@ -147,7 +147,7 @@ class SyncService:
         Priority order:
         1. Explicit IDs from config.yaml (folder_ids)
         2. Persisted mapping from state.json (folder_map)
-        3. Live read from cache-v4.json (updates state)
+        3. Live read from Granola cache file (auto-discovered, updates state)
 
         Returns:
             Dict mapping folder titles to their IDs

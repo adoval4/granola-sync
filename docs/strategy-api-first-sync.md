@@ -2,14 +2,14 @@
 
 **Date:** 2026-03-03
 **Status:** Approved
-**Problem:** `cache-v4.json` is not reliably updated by the Granola desktop app — it can lag behind by 2+ days, causing recent meetings to be missed entirely.
+**Problem:** The Granola cache file is not reliably updated by the desktop app — it can lag behind by 2+ days, causing recent meetings to be missed entirely.
 
 ---
 
 ## Context & Findings
 
 ### Current State
-- `cache-v4.json` last modified: **March 1** (2 days stale)
+- Granola cache file last modified: **March 1** (2 days stale)
 - Most recent meeting in API: **March 3** (today, real-time)
 - `GET /v2/get-document-lists` API: **broken** (returns HTTP 500)
 - `POST /v2/get-documents` API: **works** — returns real-time data, supports `list_id` filtering
@@ -27,7 +27,7 @@ Documents returned by the API include:
 - Does **not** include folder/list membership info
 
 ### Key Insight
-The API's `POST /v2/get-documents` endpoint accepts a `list_id` parameter to filter by folder. The folder ID mapping can be resolved from `cache-v4.json` and persisted in state.
+The API's `POST /v2/get-documents` endpoint accepts a `list_id` parameter to filter by folder. The folder ID mapping can be resolved from the Granola cache file (auto-discovered `cache-v*.json`) and persisted in state.
 
 ---
 
@@ -54,7 +54,7 @@ The API's `POST /v2/get-documents` endpoint accepts a `list_id` parameter to fil
 │  1. Resolve folder IDs                               │
 │     ├─ Check config.yaml for explicit folder_ids     │
 │     ├─ Check state.json folder_map                   │
-│     └─ Read cache-v4.json → update folder_map        │
+│     └─ Read cache-v*.json → update folder_map         │
 │                                                      │
 │  2. For each folder:                                 │
 │     └─ API: POST /v2/get-documents {list_id}         │
@@ -141,7 +141,7 @@ def _resolve_folder_map(self) -> dict[str, str]:
     # Priority 2: Cached mapping from state.json
     folder_map.update(self.state.get_folder_map())
 
-    # Priority 3: Read from cache-v4.json (if available)
+    # Priority 3: Read from Granola cache (auto-discovered)
     try:
         cache = GranolaCacheReader()
         cache_map = cache.get_folder_map()
