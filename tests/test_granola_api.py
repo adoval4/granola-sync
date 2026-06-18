@@ -12,9 +12,7 @@ import respx
 from granola_sync.granola_api import (
     GranolaCacheReader,
     GranolaClient,
-    _get_granola_app_dir,
     get_granola_token,
-    get_token_file_path,
     is_token_expired,
     refresh_access_token,
 )
@@ -303,7 +301,7 @@ class TestGranolaCacheReader:
     @pytest.mark.asyncio
     async def test_get_folders_both_fail(self, cache_dir: Path):
         """GranolaClient.get_folders raises RuntimeError when cache and API both fail."""
-        respx.get("https://api.granola.ai/v2/get-document-lists").mock(
+        respx.post("https://api.granola.ai/v1/get-document-lists-metadata").mock(
             return_value=httpx.Response(500, json={"error": "Internal Server Error"})
         )
 
@@ -365,14 +363,21 @@ class TestGranolaClient:
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_folders(self, client):
-        """Test fetching folders via API fallback when cache is unavailable."""
-        mock_folders = [
-            {"id": "folder1", "title": "Sales Calls", "documents": []},
-            {"id": "folder2", "title": "Standups", "documents": [{"id": "doc1"}]},
-        ]
+        """Test fetching folders via API fallback when cache is unavailable.
 
-        respx.get("https://api.granola.ai/v2/get-document-lists").mock(
-            return_value=httpx.Response(200, json={"lists": mock_folders})
+        The working endpoint (POST /v1/get-document-lists-metadata) returns
+        folder metadata keyed by list ID.
+        """
+        respx.post("https://api.granola.ai/v1/get-document-lists-metadata").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "lists": {
+                        "folder1": {"id": "folder1", "title": "Sales Calls"},
+                        "folder2": {"id": "folder2", "title": "Standups"},
+                    }
+                },
+            )
         )
 
         with patch(
@@ -382,8 +387,32 @@ class TestGranolaClient:
             folders = await client.get_folders()
 
         assert len(folders) == 2
-        assert folders[0]["title"] == "Sales Calls"
-        assert folders[1]["title"] == "Standups"
+        titles = {f["title"] for f in folders}
+        assert titles == {"Sales Calls", "Standups"}
+        assert all(f["documents"] == [] for f in folders)
+
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_get_folder_map(self, client):
+        """GranolaClient.get_folder_map returns a title→ID mapping from the API."""
+        respx.post("https://api.granola.ai/v1/get-document-lists-metadata").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "lists": {
+                        "fli-id": {"id": "fli-id", "title": "FLI"},
+                        "sqp-id": {"id": "sqp-id", "title": "SQP"},
+                        "untitled": {"id": "untitled"},
+                    }
+                },
+            )
+        )
+
+        folder_map = await client.get_folder_map()
+
+        assert folder_map == {"FLI": "fli-id", "SQP": "sqp-id"}
 
         await client.close()
 

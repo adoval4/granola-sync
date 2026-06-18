@@ -85,7 +85,7 @@ class SyncService:
 
         try:
             # 1. Resolve folder name → ID mapping
-            folder_map = self._resolve_folder_map()
+            folder_map = await self._resolve_folder_map()
 
             # 2. Process each configured folder
             for folder_name in configured_folders:
@@ -141,13 +141,16 @@ class SyncService:
 
         return summary
 
-    def _resolve_folder_map(self) -> dict[str, str]:
+    async def _resolve_folder_map(self) -> dict[str, str]:
         """Resolve folder names to IDs from multiple sources.
 
         Priority order:
         1. Explicit IDs from config.yaml (folder_ids)
         2. Persisted mapping from state.json (folder_map)
         3. Live read from Granola cache file (auto-discovered, updates state)
+        4. Granola API, as a fallback for any folder still unresolved — newer
+           Granola versions encrypt the cache, so the API is the only reliable
+           source in that case.
 
         Returns:
             Dict mapping folder titles to their IDs
@@ -166,13 +169,26 @@ class SyncService:
             logger.debug("folder_map_cache_unavailable", error=str(e))
 
         # Priority 2: Persisted mapping from state (overrides cache if present)
-        state_map = self.state.get_folder_map()
-        folder_map.update(state_map)
+        folder_map.update(self.state.get_folder_map())
 
         # Priority 1 (highest): Explicit config overrides
         if self.config.granola.folder_ids:
             folder_map.update(self.config.granola.folder_ids)
             logger.debug("folder_map_from_config", count=len(self.config.granola.folder_ids))
+
+        # Fallback: fetch only the folders still unresolved from the API. This
+        # never overrides config/state/cache, and is skipped entirely when they
+        # already cover every configured folder.
+        unresolved = set(self.config.granola.folders) - folder_map.keys()
+        if unresolved:
+            try:
+                api_map = await self.granola.get_folder_map()
+                new_entries = {name: api_map[name] for name in unresolved if name in api_map}
+                folder_map.update(new_entries)
+                self.state.update_folder_map(new_entries)
+                logger.debug("folder_map_from_api", count=len(new_entries))
+            except Exception as e:
+                logger.warning("folder_map_api_unavailable", error=str(e))
 
         return folder_map
 
