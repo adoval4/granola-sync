@@ -45,13 +45,16 @@ granola-sync --help
 ### Folder resolution priority
 1. Explicit `folder_ids` in config (highest)
 2. Persisted `folder_map` in state.json
-3. Cache file lookup (updates state for next time)
+3. Granola API (`POST /v1/get-document-lists-metadata`) when the cache does not
+   resolve every configured folder — newer Granola versions encrypt the cache
+4. Cache file lookup (updates state for next time)
 
 ### Granola API status
 - `POST /v2/get-documents` — works, primary data source
 - `POST /v1/get-document-transcript` — works
 - `POST /v1/refresh-access-token` — works
-- `GET /v2/get-document-lists` — **broken (HTTP 500)**, folder IDs resolved via cache + state
+- `POST /v1/get-document-lists-metadata` — works, resolves folder name → ID (API fallback)
+- `GET /v2/get-document-lists` — **broken (HTTP 500)**, replaced by the metadata endpoint above
 
 ## Testing patterns
 

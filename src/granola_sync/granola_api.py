@@ -305,14 +305,17 @@ class GranolaClient:
 
         # Fallback to API
         try:
-            client = await self._get_client()
             logger.debug("fetching_folders")
-
-            response = await client.get("/v2/get-document-lists")
-            response.raise_for_status()
-
-            data = response.json()
-            folders = data.get("lists", [])
+            lists = await self._fetch_document_lists_metadata()
+            folders = [
+                {
+                    "id": meta.get("id", list_id),
+                    "title": meta.get("title", ""),
+                    "documents": [],
+                }
+                for list_id, meta in lists.items()
+                if isinstance(meta, dict)
+            ]
             logger.debug("folders_fetched", count=len(folders))
             return folders
         except Exception as api_error:
@@ -320,6 +323,45 @@ class GranolaClient:
                 f"Failed to load folders. "
                 f"Cache error: {cache_error}; API error: {api_error}"
             ) from api_error
+
+    async def _fetch_document_lists_metadata(self) -> dict[str, Any]:
+        """Fetch folder (document list) metadata keyed by list ID from the API.
+
+        Uses POST /v1/get-document-lists-metadata. (GET /v2/get-document-lists,
+        the previous endpoint, returns HTTP 500.) Shared by get_folders() and
+        get_folder_map().
+
+        Returns:
+            Mapping of list ID → metadata dict
+        """
+        client = await self._get_client()
+        response = await client.post("/v1/get-document-lists-metadata", json={})
+        response.raise_for_status()
+
+        data = response.json()
+        lists = data.get("lists", {}) if isinstance(data, dict) else {}
+        return lists if isinstance(lists, dict) else {}
+
+    async def get_folder_map(self) -> dict[str, str]:
+        """Get a mapping of folder title → ID from the Granola API.
+
+        API equivalent of GranolaCacheReader.get_folder_map(). This is the
+        reliable way to resolve folder names when the local cache is
+        unavailable — newer Granola versions encrypt cache-v6.json, leaving it
+        without a usable ``documents`` key.
+
+        Returns:
+            Dict mapping folder titles to their IDs
+        """
+        logger.debug("fetching_folder_map")
+        lists = await self._fetch_document_lists_metadata()
+        folder_map = {
+            meta.get("title", ""): meta.get("id", list_id)
+            for list_id, meta in lists.items()
+            if isinstance(meta, dict) and meta.get("title")
+        }
+        logger.debug("folder_map_fetched", count=len(folder_map))
+        return folder_map
 
     async def get_documents_by_folder(
         self, list_id: str, limit: int = 100, offset: int = 0

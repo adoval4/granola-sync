@@ -35,6 +35,7 @@ def mock_granola() -> MagicMock:
     mock.get_documents_by_folder = AsyncMock(return_value=[])
     mock.get_document = AsyncMock()
     mock.get_transcript = AsyncMock()
+    mock.get_folder_map = AsyncMock(return_value={})
     mock.close = AsyncMock()
     return mock
 
@@ -201,6 +202,40 @@ class TestSyncService:
 
         assert summary["folders_checked"] == 1
         assert summary["by_folder"]["UNKNOWN"]["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_sync_once_folder_resolved_via_api(
+        self, config: Config, mock_granola: MagicMock, mock_webhook: MagicMock, state_manager: StateManager
+    ):
+        """Folder names resolve via the API when the local cache is unavailable.
+
+        Reproduces newer Granola versions where cache-v6.json is encrypted and
+        has no usable ``documents`` key, so the cache folder map is empty.
+        """
+        docs = [_make_doc("doc1", "Sprint Planning", "Notes")]
+        mock_granola.get_documents_by_folder.return_value = docs
+        mock_granola.get_folder_map.return_value = {"FLI": "fli-folder-id"}
+
+        service = SyncService(
+            config, granola=mock_granola, webhook=mock_webhook, state=state_manager
+        )
+        # No explicit folder_ids — resolution must come from the API.
+        service.config = Config(
+            webhook=config.webhook,
+            granola=GranolaConfig(folders=["FLI"], folder_ids={}),
+            sync=config.sync,
+            state=config.state,
+        )
+
+        with patch("granola_sync.sync.GranolaCacheReader") as mock_cache_cls:
+            mock_cache_cls.return_value.get_folder_map.side_effect = FileNotFoundError("no cache")
+            summary = await service.sync_once()
+
+        mock_granola.get_folder_map.assert_awaited_once()
+        mock_granola.get_documents_by_folder.assert_awaited_once_with("fli-folder-id")
+        assert summary["documents_synced"] == 1
+        # The API-resolved mapping is persisted for future cycles.
+        assert state_manager.get_folder_map().get("FLI") == "fli-folder-id"
 
     @pytest.mark.asyncio
     async def test_sync_once_dry_run(
@@ -380,7 +415,7 @@ class TestFolderMapResolution:
         service = SyncService(
             config, granola=mock_granola, webhook=mock_webhook, state=state_manager
         )
-        folder_map = service._resolve_folder_map()
+        folder_map = await service._resolve_folder_map()
 
         # Config value should win
         assert folder_map["SQP"] == "sqp-folder-id"
@@ -404,7 +439,7 @@ class TestFolderMapResolution:
 
         with patch("granola_sync.sync.GranolaCacheReader") as mock_cache_cls:
             mock_cache_cls.return_value.get_folder_map.side_effect = FileNotFoundError("no cache")
-            folder_map = service._resolve_folder_map()
+            folder_map = await service._resolve_folder_map()
 
         assert folder_map["SQP"] == "state-folder-id"
 
@@ -425,7 +460,7 @@ class TestFolderMapResolution:
 
         with patch("granola_sync.sync.GranolaCacheReader") as mock_cache_cls:
             mock_cache_cls.return_value.get_folder_map.return_value = {"SQP": "cache-folder-id"}
-            folder_map = service._resolve_folder_map()
+            folder_map = await service._resolve_folder_map()
 
         assert folder_map["SQP"] == "cache-folder-id"
         assert state_manager.get_folder_map()["SQP"] == "cache-folder-id"
